@@ -7262,6 +7262,47 @@ var WaterStore = {
   }
 };
 
+// ระยะการเจริญเติบโต → ช่วงระดับน้ำตั้งต้น (ซม.)
+// เป็นค่าตั้งต้นให้ปรับต่อได้ ไม่ใช่ค่ารับรอง ควรตรวจกับคำแนะนำของกรมการข้าวก่อนใช้จริง
+var WATER_STAGES = [
+  { key: "germ",     name: "งอก/เพาะ",          min: 0,   max: 3 },
+  { key: "seedling", name: "ต้นกล้า",           min: 1,   max: 3 },
+  { key: "tiller",   name: "แตกกอ",            min: 3,   max: 5 },
+  { key: "panicle",  name: "ตั้งท้อง",          min: 5,   max: 10 },
+  { key: "flower",   name: "ออกดอก",           min: 5,   max: 10 },
+  { key: "ripen",    name: "ข้าวสุก ระบายน้ำ",  min: -15, max: 0 }
+];
+
+// ที่อยู่ Worker กับรหัสอุปกรณ์ ใช้ร่วมกันทุกแปลงของผู้ใช้คนเดียว
+function iotConf() {
+  try {
+    var c = JSON.parse(localStorage.getItem("smartrice-iot:" + Plots._uid()) || "null");
+    return (c && typeof c === "object") ? c : {};
+  } catch (e) { return {}; }
+}
+function iotSave(c) {
+  try { localStorage.setItem("smartrice-iot:" + Plots._uid(), JSON.stringify(c)); } catch (e) { /* พื้นที่เต็ม */ }
+}
+
+// ส่งค่าเป้าหมายขึ้น Worker ให้บอร์ดมาดึงไปควบคุมปั๊ม/วาล์ว
+// auto=false แปลว่าโหมดควบคุมเอง บอร์ดจะหยุดสั่งงานทั้งหมด
+async function pushTarget(st) {
+  var c = iotConf();
+  if (!c.url || !c.key) return null;
+  var res = await fetch(c.url.replace(/\/+$/, "") + "/target", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Key": c.key },
+    body: JSON.stringify({
+      min: typeof st.min === "number" ? st.min : null,
+      max: typeof st.max === "number" ? st.max : null,
+      stage: st.stage || null,
+      auto: st.mode === "auto"
+    })
+  });
+  if (!res.ok) throw new Error("Worker ตอบ HTTP " + res.status);
+  return st.mode === "auto" ? "ส่งค่าเป้าหมายให้บอร์ดแล้ว (บอร์ดควบคุมน้ำอัตโนมัติ)" : "ส่งแล้ว: โหมดควบคุมเอง บอร์ดจะไม่สั่งงาน";
+}
+
 function tgConf() {
   try {
     var c = JSON.parse(localStorage.getItem("smartrice-tg:" + Plots._uid()) || "null");
@@ -7427,6 +7468,7 @@ views.water = function (root) {
         var s = WaterStore.read();
         s.mode = m[0];
         WaterStore.write(s);
+        pushTarget(s).catch(function () { /* ส่งไม่ได้ก็ไม่ขวางการสลับโหมด */ });
         open(here);   // วาดหน้าใหม่ เพื่อเริ่ม/หยุดตัวอ่านเซนเซอร์ให้ตรงโหมด
       };
       chips.appendChild(b);
@@ -7480,18 +7522,19 @@ views.water = function (root) {
         "เซนเซอร์ต้องตอบเป็น JSON ที่มีฟิลด์ level_cm (หรือ level) หน่วยเป็นซม."));
 
       // อ่านเองทุก 1 นาทีขณะเปิดหน้านี้ ตัวจับเวลาจะถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
-      if (st.url) {
+      if (st.url || iotConf().url) {
         pollSensor(false);
         onPageTimer(function () { pollSensor(false); }, 60000);
       }
 
       async function pollSensor(showErr) {
         var s = WaterStore.read();
-        if (!s.url) { if (showErr) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "ยังไม่ได้ใส่ที่อยู่เซนเซอร์")); } return; }
+        var srcUrl = s.url || (iotConf().url ? iotConf().url.replace(/\/+$/, "") + "/level" : null);
+        if (!srcUrl) { if (showErr) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "ยังไม่ได้ใส่ที่อยู่เซนเซอร์")); } return; }
         try {
           var ctrl = new AbortController();
           var t = setTimeout(function () { ctrl.abort(); }, 8000);
-          var res = await fetch(s.url, { signal: ctrl.signal });
+          var res = await fetch(srcUrl, { signal: ctrl.signal });
           clearTimeout(t);
           var d = await res.json();
           var v = parseFloat(d.level_cm != null ? d.level_cm : d.level);
@@ -7600,6 +7643,29 @@ views.water = function (root) {
   rr.appendChild(labeled("สูงสุด (ซม.)", maxIn));
   rr.appendChild(saveR);
   rr.appendChild(clearR);
+  var stageLab = el("div", "read-foot", "ระยะการเจริญเติบโต (เลือกแล้วใส่ช่วงตั้งต้นให้ ปรับตัวเลขต่อได้)");
+  card3.appendChild(stageLab);
+  var stageChips = el("div", "mchips");
+  stageChips.style.marginTop = "6px";
+  card3.appendChild(stageChips);
+  function paintStages() {
+    var cur = WaterStore.read().stage;
+    stageChips.innerHTML = "";
+    WATER_STAGES.forEach(function (g) {
+      var b = el("button", "act act-sm " + (cur === g.key ? "act-go" : "act-line"), g.name);
+      b.onclick = function () {
+        var s = WaterStore.read();
+        s.stage = g.key;
+        WaterStore.write(s);
+        minIn.value = String(g.min);
+        maxIn.value = String(g.max);
+        saveR.onclick();
+        paintStages();
+      };
+      stageChips.appendChild(b);
+    });
+  }
+  paintStages();
   card3.appendChild(rr);
   rangeFlash = el("div");
   rangeFlash.style.marginTop = "10px";
@@ -7631,11 +7697,49 @@ views.water = function (root) {
     WaterStore.write(s);
     paintStatus();
     rangeFlash.appendChild(el("div", "read-foot", "บันทึกช่วงแล้ว"));
+    pushTarget(s).then(function (m) {
+      if (m) rangeFlash.appendChild(el("div", "read-foot", m));
+    }).catch(function (e) {
+      rangeFlash.appendChild(el("div", "flash flash-warn", "ส่งให้บอร์ดไม่สำเร็จ: " + e.message));
+    });
   };
   clearR.onclick = function () {
     minIn.value = "";
     maxIn.value = "";
     saveR.onclick();
+  };
+
+  // ── 4) เชื่อมบอร์ด ESP32 ผ่าน Worker ──
+  root.appendChild(bund("เชื่อมบอร์ด ESP32"));
+  var card4 = plot(null);
+  var ic = iotConf();
+  var wUrl = textInput("text", "https://ชื่อ-worker.xxx.workers.dev", ic.url || "", "min(100%,360px)");
+  var wKey = textInput("password", "รหัสอุปกรณ์ (DEVICE_KEY)", ic.key || "", "min(100%,260px)");
+  var r4 = rowBox();
+  r4.style.marginTop = "0";
+  r4.appendChild(labeled("ที่อยู่ Worker", wUrl));
+  r4.appendChild(labeled("รหัสอุปกรณ์", wKey));
+  card4.appendChild(r4);
+  var saveW = el("button", "act act-go act-sm", "บันทึกและส่งค่าให้บอร์ด");
+  var r5 = rowBox();
+  r5.appendChild(saveW);
+  card4.appendChild(r5);
+  var wMsg = el("div");
+  wMsg.style.marginTop = "10px";
+  card4.appendChild(wMsg);
+  card4.appendChild(el("div", "read-foot",
+    "โหมดอัตโนมัติ: บอร์ดดึงช่วงระดับน้ำจากเว็บ แล้วสั่งปั๊มเติมน้ำหรือวาล์วระบายเองให้อยู่ในช่วง " +
+    "ค่าระดับน้ำที่บอร์ดวัดจะส่งกลับมาแสดงที่ส่วนบนของหน้านี้โดยไม่ต้องกรอก"));
+  root.appendChild(card4);
+  saveW.onclick = async function () {
+    iotSave({ url: wUrl.value.trim(), key: wKey.value.trim() });
+    wMsg.innerHTML = "";
+    try {
+      var m = await pushTarget(WaterStore.read());
+      wMsg.appendChild(el("div", m ? "flash flash-ok" : "read-foot", m || "บันทึกแล้ว"));
+    } catch (e) {
+      wMsg.appendChild(el("div", "flash flash-warn", "เชื่อมไม่สำเร็จ: " + e.message));
+    }
   };
 
   paintStatus();
