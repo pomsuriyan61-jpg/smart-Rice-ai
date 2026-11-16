@@ -2623,8 +2623,8 @@ function th(l) {
 // เพราะเป็นงานตั้งค่าที่ทำครั้งเดียวจบ ไม่ควรกินที่ในเมนูหลักตลอดเวลา
 var PAGES = [
   { id: "field", label: "ข้อมูลการเกษตร", short: "แปลงนา", kicker: "แปลงนา",
-    parts: ["plots", "season", "method", "weather"],
-    jump: ["ที่นา", "พันธุ์ข้าว", "วิธีทำนา", "อากาศ"],
+    parts: ["plots", "season", "method", "weather", "water"],
+    jump: ["ที่นา", "พันธุ์ข้าว", "วิธีทำนา", "อากาศ", "ระดับน้ำ"],
     icon: "M12 21s7-6.5 7-11a7 7 0 10-14 0c0 4.5 7 11 7 11zm0-8a3 3 0 100-6 3 3 0 000 6z" },
 
   // แท็บ 2 · ระยะเตรียมดิน — งานที่ทำครั้งเดียวก่อนข้าวลงแปลง
@@ -4956,6 +4956,7 @@ var PAGE_CITE = {
   diagnose: ["กรมการข้าว"],
   consult:  ["กรมการข้าว"],
   weather:  ["Open-Meteo", "WeatherAPI", "กรมการข้าว"],
+  water:    ["กรมการข้าว"],
   harvest:  ["สำนักงานเศรษฐกิจการเกษตร", "กรมการข้าว"],
   cost:     ["สำนักงานเศรษฐกิจการเกษตร", "กรมการค้าภายใน"],
   ledger:   ["บันทึกของคุณเอง"],
@@ -7233,6 +7234,413 @@ views.season = function (root) {
   paintCal();
 
   root.appendChild(card);
+};
+
+
+// ═══════════════════════════════════════════════════
+// ระดับน้ำในแปลงนา (เพิ่มตามแผนผังระบบ — ส่วนที่ 5 ของแท็บแปลงนา)
+// ═══════════════════════════════════════════════════
+//
+// สี่เรื่องตามแผนผัง: ดูระดับน้ำ / เลือกควบคุมเอง-อัตโนมัติ / แจ้งเตือน Telegram / เลือกช่วงระดับน้ำเอง
+//
+// ช่วงระดับน้ำที่เหมาะกับแต่ละระยะข้าวไม่ได้ใส่ตัวเลขตายตัวไว้ให้ เพราะตัวเลขต้องมาจากกรมการข้าว
+// จึงให้ผู้ใช้กรอกช่วงเอง พร้อมลิงก์ไปคลังความรู้ข้าวของกรมการข้าวเพื่อดูค่าอ้างอิง
+//
+// ข้อมูลเก็บในเครื่องแยกรายแปลง (plotKey) ส่วน Bot Token กับ Chat ID ใช้ร่วมกันทุกแปลงของผู้ใช้คนเดียวกัน
+var WaterStore = {
+  read: function () {
+    var v = null;
+    try { v = JSON.parse(localStorage.getItem(plotKey("water")) || "null"); } catch (e) { v = null; }
+    if (!v || typeof v !== "object") v = {};
+    if (!Array.isArray(v.log)) v.log = [];
+    if (v.mode !== "auto") v.mode = "manual";
+    return v;
+  },
+  write: function (v) {
+    v.log = v.log.slice(-200);
+    try { localStorage.setItem(plotKey("water"), JSON.stringify(v)); } catch (e) { /* พื้นที่เต็ม */ }
+  }
+};
+
+function tgConf() {
+  try {
+    var c = JSON.parse(localStorage.getItem("smartrice-tg:" + Plots._uid()) || "null");
+    return (c && typeof c === "object") ? c : {};
+  } catch (e) { return {}; }
+}
+function tgSave(c) {
+  try { localStorage.setItem("smartrice-tg:" + Plots._uid(), JSON.stringify(c)); } catch (e) { /* พื้นที่เต็ม */ }
+}
+async function tgSend(text) {
+  var c = tgConf();
+  if (!c.token || !c.chat) throw new Error("ยังไม่ได้ใส่ Bot Token หรือ Chat ID");
+  if (!/^\d+:[A-Za-z0-9_-]+$/.test(c.token)) throw new Error("รูปแบบ Bot Token ไม่ถูกต้อง");
+  var res = await fetch("https://api.telegram.org/bot" + c.token + "/sendMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: c.chat, text: text })
+  });
+  var d = {};
+  try { d = await res.json(); } catch (e) { d = {}; }
+  if (!res.ok || d.ok === false) throw new Error(d.description || ("ส่งไม่สำเร็จ (HTTP " + res.status + ")"));
+}
+
+// low = ต่ำกว่าช่วง, high = สูงกว่าช่วง, ok = อยู่ในช่วง, null = ยังไม่ได้ตั้งช่วง
+function waterZone(level, st) {
+  if (typeof level !== "number" || isNaN(level)) return null;
+  var hasMin = typeof st.min === "number", hasMax = typeof st.max === "number";
+  if (hasMin && level < st.min) return "low";
+  if (hasMax && level > st.max) return "high";
+  return (hasMin || hasMax) ? "ok" : null;
+}
+
+function waterRangeText(st) {
+  var a = typeof st.min === "number", b = typeof st.max === "number";
+  if (a && b) return st.min + " ถึง " + st.max + " ซม.";
+  if (a) return "ไม่ต่ำกว่า " + st.min + " ซม.";
+  if (b) return "ไม่เกิน " + st.max + " ซม.";
+  return "";
+}
+
+function waterWhen(ts) {
+  try {
+    return new Date(ts).toLocaleString("th-TH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  } catch (e) { return ""; }
+}
+
+// บันทึกค่าหนึ่งครั้ง แล้วส่ง Telegram ถ้าออกนอกช่วง
+// ไม่ส่งซ้ำโซนเดิมภายใน 30 นาที ไม่งั้นโหมดอัตโนมัติจะยิงข้อความทุกนาทีจนผู้ใช้ปิดแจ้งเตือนทิ้ง
+async function recordWater(level, source) {
+  var st = WaterStore.read();
+  var now = Date.now();
+  st.log.push({ v: level, at: now, src: source });
+  var zone = waterZone(level, st);
+  var note = null;
+
+  if (st.tg && (zone === "low" || zone === "high")) {
+    var last = st.lastAlert;
+    if (!(last && last.zone === zone && now - last.at < 30 * 60 * 1000)) {
+      var plotName = (Plots.list().filter(function (p) { return p.id === Plots.activeId(); })[0] || {}).name || "ที่นา";
+      var msg = "SmartRice AI · " + plotName + "\n" +
+        "ระดับน้ำ " + level + " ซม. " + (zone === "low" ? "ต่ำกว่า" : "สูงกว่า") +
+        "ช่วงที่ตั้งไว้ (" + waterRangeText(st) + ")\n" +
+        (zone === "low" ? "ควรเติมน้ำเข้าแปลง" : "ควรระบายน้ำออก");
+      try {
+        await tgSend(msg);
+        st.lastAlert = { zone: zone, at: now };
+        note = "ส่งแจ้งเตือนไป Telegram แล้ว";
+      } catch (e) {
+        note = "ส่ง Telegram ไม่สำเร็จ: " + e.message;
+      }
+    }
+  } else if (zone === "ok") {
+    st.lastAlert = null;   // กลับเข้าช่วงแล้ว ครั้งหน้าที่หลุดช่วงต้องแจ้งทันที
+  }
+  WaterStore.write(st);
+  return { zone: zone, note: note };
+}
+
+views.water = function (root) {
+  var statusHost, modeHost, rangeFlash;
+
+  function numInput(ph, val) {
+    var i = el("input");
+    i.type = "number";
+    i.step = "0.5";
+    i.placeholder = ph;
+    i.style.cssText = "padding:9px 12px;border:1px solid var(--rule);border-radius:var(--r-sm);width:130px";
+    if (typeof val === "number") i.value = String(val);
+    return i;
+  }
+  function textInput(type, ph, val, w) {
+    var i = el("input");
+    i.type = type;
+    i.placeholder = ph;
+    i.autocomplete = "off";
+    i.style.cssText = "padding:9px 12px;border:1px solid var(--rule);border-radius:var(--r-sm);width:" + (w || "100%");
+    if (val) i.value = val;
+    return i;
+  }
+  function labeled(label, node) {
+    var b = el("div");
+    b.appendChild(el("div", "read-foot", label));
+    b.appendChild(node);
+    return b;
+  }
+  function rowBox() {
+    var r = el("div");
+    r.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap;margin-top:12px";
+    return r;
+  }
+
+  // ── 1) ระดับน้ำ + เลือกโหมด ──
+  root.appendChild(bund("ระดับน้ำในแปลงนา"));
+  var card1 = plot(null);
+  statusHost = el("div");
+  card1.appendChild(statusHost);
+  modeHost = el("div");
+  card1.appendChild(modeHost);
+  root.appendChild(card1);
+
+  function paintStatus() {
+    var st = WaterStore.read();
+    statusHost.innerHTML = "";
+    var last = st.log[st.log.length - 1];
+    var foot = last
+      ? waterWhen(last.at) + (last.src === "auto" ? " · จากเซนเซอร์" : " · กรอกเอง")
+      : "กรอกค่าที่วัดได้ หรือเลือกโหมดอัตโนมัติ";
+    statusHost.appendChild(readOut("ระดับน้ำล่าสุด", last ? last.v + " ซม." : "ยังไม่มีข้อมูล", foot));
+
+    if (last) {
+      var z = waterZone(last.v, st);
+      var rt = waterRangeText(st);
+      if (z === "low") statusHost.appendChild(el("div", "flash flash-warn", "ต่ำกว่าช่วงที่ตั้งไว้ (" + rt + ") ควรเติมน้ำเข้าแปลง"));
+      else if (z === "high") statusHost.appendChild(el("div", "flash flash-warn", "สูงกว่าช่วงที่ตั้งไว้ (" + rt + ") ควรระบายน้ำออก"));
+      else if (z === "ok") statusHost.appendChild(el("div", "flash flash-ok", "อยู่ในช่วงที่ตั้งไว้ (" + rt + ")"));
+      else statusHost.appendChild(el("div", "read-foot", "ยังไม่ได้ตั้งช่วงระดับน้ำ ตั้งได้ที่ส่วนล่างของหน้านี้"));
+    }
+
+    // ประวัติ 5 ค่าล่าสุด
+    var recent = st.log.slice(-6, -1).reverse();
+    if (recent.length) {
+      var h = el("div", "read-foot", "ค่าก่อนหน้า: " + recent.map(function (r) {
+        return r.v + " ซม. (" + waterWhen(r.at) + ")";
+      }).join(" · "));
+      h.style.marginTop = "10px";
+      statusHost.appendChild(h);
+    }
+  }
+
+  function paintMode() {
+    var st = WaterStore.read();
+    modeHost.innerHTML = "";
+
+    var lab = el("div", "read-foot", "วิธีรับค่าระดับน้ำ");
+    lab.style.marginTop = "14px";
+    modeHost.appendChild(lab);
+
+    var chips = el("div", "mchips");
+    chips.style.marginTop = "6px";
+    [["manual", "ควบคุมเอง"], ["auto", "อัตโนมัติ"]].forEach(function (m) {
+      var b = el("button", "act act-sm " + (st.mode === m[0] ? "act-go" : "act-line"), m[1]);
+      b.onclick = function () {
+        var s = WaterStore.read();
+        s.mode = m[0];
+        WaterStore.write(s);
+        open(here);   // วาดหน้าใหม่ เพื่อเริ่ม/หยุดตัวอ่านเซนเซอร์ให้ตรงโหมด
+      };
+      chips.appendChild(b);
+    });
+    modeHost.appendChild(chips);
+
+    var msg = el("div");
+    msg.style.marginTop = "10px";
+
+    if (st.mode === "manual") {
+      var lvl = numInput("เช่น 5", null);
+      var save = el("button", "act act-go act-sm", "บันทึกระดับน้ำ");
+      var r = rowBox();
+      r.appendChild(labeled("ระดับน้ำที่วัดได้ (ซม.) ใส่ค่าลบถ้าน้ำต่ำกว่าผิวดิน", lvl));
+      r.appendChild(save);
+      modeHost.appendChild(r);
+      modeHost.appendChild(msg);
+      save.onclick = async function () {
+        var v = parseFloat(lvl.value);
+        if (isNaN(v)) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "กรอกระดับน้ำเป็นตัวเลขก่อน")); return; }
+        save.disabled = true;
+        var res = await recordWater(v, "manual");
+        save.disabled = false;
+        lvl.value = "";
+        paintStatus();
+        msg.innerHTML = "";
+        if (res.note) msg.appendChild(el("div", "read-foot", res.note));
+      };
+    } else {
+      var url = textInput("text", "https://... ที่อยู่เซนเซอร์ที่ตอบเป็น JSON", st.url || "", "min(100%,360px)");
+      var saveU = el("button", "act act-go act-sm", "บันทึกที่อยู่");
+      var readNow = el("button", "act act-line act-sm", "อ่านตอนนี้");
+      var r2 = rowBox();
+      r2.appendChild(labeled("ที่อยู่เซนเซอร์วัดระดับน้ำ", url));
+      r2.appendChild(saveU);
+      r2.appendChild(readNow);
+      modeHost.appendChild(r2);
+      modeHost.appendChild(msg);
+
+      saveU.onclick = function () {
+        var s = WaterStore.read();
+        s.url = url.value.trim() || null;
+        WaterStore.write(s);
+        msg.innerHTML = "";
+        msg.appendChild(el("div", "read-foot", s.url ? "บันทึกแล้ว ระบบจะอ่านทุก 1 นาทีขณะเปิดหน้านี้" : "ลบที่อยู่แล้ว"));
+        pollSensor(true);
+      };
+      readNow.onclick = function () { pollSensor(true); };
+
+      msg.appendChild(el("div", "read-foot",
+        "เซนเซอร์ต้องตอบเป็น JSON ที่มีฟิลด์ level_cm (หรือ level) หน่วยเป็นซม."));
+
+      // อ่านเองทุก 1 นาทีขณะเปิดหน้านี้ ตัวจับเวลาจะถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
+      if (st.url) {
+        pollSensor(false);
+        onPageTimer(function () { pollSensor(false); }, 60000);
+      }
+
+      async function pollSensor(showErr) {
+        var s = WaterStore.read();
+        if (!s.url) { if (showErr) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "ยังไม่ได้ใส่ที่อยู่เซนเซอร์")); } return; }
+        try {
+          var ctrl = new AbortController();
+          var t = setTimeout(function () { ctrl.abort(); }, 8000);
+          var res = await fetch(s.url, { signal: ctrl.signal });
+          clearTimeout(t);
+          var d = await res.json();
+          var v = parseFloat(d.level_cm != null ? d.level_cm : d.level);
+          if (isNaN(v)) throw new Error("ไม่พบฟิลด์ level_cm ในคำตอบ");
+          var out = await recordWater(v, "auto");
+          paintStatus();
+          if (showErr && out.note) { msg.innerHTML = ""; msg.appendChild(el("div", "read-foot", out.note)); }
+        } catch (e) {
+          if (showErr) {
+            msg.innerHTML = "";
+            msg.appendChild(el("div", "flash flash-warn",
+              "อ่านเซนเซอร์ไม่ได้: " + (e.name === "AbortError" ? "หมดเวลา" : e.message) +
+              " (เบราว์เซอร์ต้องเข้าถึงที่อยู่นี้ได้ และต้องเป็น https ถ้าเว็บนี้เปิดผ่าน https)"));
+          }
+        }
+      }
+    }
+  }
+
+  // ── 2) แจ้งเตือน Telegram ──
+  root.appendChild(bund("แจ้งเตือน Telegram"));
+  var card2 = plot(null);
+  var tgHost = el("div");
+  card2.appendChild(tgHost);
+  root.appendChild(card2);
+
+  function paintTg() {
+    var st = WaterStore.read();
+    var c = tgConf();
+    tgHost.innerHTML = "";
+
+    var chips = el("div", "mchips");
+    [[true, "เปิดแจ้งเตือน"], [false, "ปิด"]].forEach(function (o) {
+      var b = el("button", "act act-sm " + (!!st.tg === o[0] ? "act-go" : "act-line"), o[1]);
+      b.onclick = function () {
+        var s = WaterStore.read();
+        s.tg = o[0];
+        if (!o[0]) s.lastAlert = null;
+        WaterStore.write(s);
+        paintTg();
+      };
+      chips.appendChild(b);
+    });
+    tgHost.appendChild(chips);
+
+    var tok = textInput("password", "123456789:AA...", c.token || "", "min(100%,300px)");
+    var chat = textInput("text", "เช่น 123456789", c.chat || "", "170px");
+    var r = rowBox();
+    r.appendChild(labeled("Bot Token (จาก @BotFather)", tok));
+    r.appendChild(labeled("Chat ID", chat));
+    tgHost.appendChild(r);
+
+    var saveT = el("button", "act act-go act-sm", "บันทึก");
+    var test = el("button", "act act-line act-sm", "ส่งข้อความทดสอบ");
+    var r2 = rowBox();
+    r2.appendChild(saveT);
+    r2.appendChild(test);
+    tgHost.appendChild(r2);
+
+    var msg = el("div");
+    msg.style.marginTop = "10px";
+    tgHost.appendChild(msg);
+
+    function persist() {
+      tgSave({ token: tok.value.trim(), chat: chat.value.trim() });
+    }
+    saveT.onclick = function () {
+      persist();
+      msg.innerHTML = "";
+      msg.appendChild(el("div", "read-foot", "บันทึกแล้ว"));
+    };
+    test.onclick = async function () {
+      persist();
+      msg.innerHTML = "";
+      test.disabled = true;
+      try {
+        await tgSend("SmartRice AI: ทดสอบการแจ้งเตือนระดับน้ำ ใช้งานได้ตามปกติ");
+        msg.appendChild(el("div", "flash flash-ok", "ส่งข้อความทดสอบแล้ว ตรวจใน Telegram"));
+      } catch (e) {
+        msg.appendChild(el("div", "flash flash-warn", "ส่งไม่สำเร็จ: " + e.message));
+      }
+      test.disabled = false;
+    };
+
+    var note = el("div", "read-foot",
+      "ระบบจะแจ้งเมื่อระดับน้ำออกนอกช่วงที่ตั้งไว้ ไม่ส่งซ้ำโซนเดิมภายใน 30 นาที " +
+      "การแจ้งเตือนทำงานตอนมีการบันทึกค่า (กรอกเอง หรืออ่านจากเซนเซอร์ขณะเปิดหน้านี้)");
+    note.style.marginTop = "10px";
+    tgHost.appendChild(note);
+    tgHost.appendChild(more("Bot Token เก็บไว้ที่ไหน",
+      "เก็บในเบราว์เซอร์ของเครื่องนี้เท่านั้น ไม่ส่งไปเซิร์ฟเวอร์ของเว็บ แต่คนที่เปิดเครื่องนี้ได้ก็อ่านค่าได้ " +
+      "ควรสร้างบอตแยกสำหรับแปลงนาโดยเฉพาะ ไม่ใช้บอตที่ผูกกับงานอื่น"));
+  }
+
+  // ── 3) เลือกช่วงระดับน้ำ ──
+  root.appendChild(bund("ช่วงระดับน้ำที่ต้องการ"));
+  var card3 = plot(null);
+  var st0 = WaterStore.read();
+  var minIn = numInput("ต่ำสุด", st0.min);
+  var maxIn = numInput("สูงสุด", st0.max);
+  var saveR = el("button", "act act-go act-sm", "บันทึกช่วง");
+  var clearR = el("button", "act act-line act-sm", "ล้างช่วง");
+  var rr = rowBox();
+  rr.style.marginTop = "0";
+  rr.appendChild(labeled("ต่ำสุด (ซม.)", minIn));
+  rr.appendChild(labeled("สูงสุด (ซม.)", maxIn));
+  rr.appendChild(saveR);
+  rr.appendChild(clearR);
+  card3.appendChild(rr);
+  rangeFlash = el("div");
+  rangeFlash.style.marginTop = "10px";
+  card3.appendChild(rangeFlash);
+
+  var ref = el("div", "read-foot");
+  ref.style.marginTop = "10px";
+  ref.appendChild(document.createTextNode("ช่วงที่เหมาะกับแต่ละระยะของข้าว ดูข้อมูลได้ที่ "));
+  var a = el("a", "", "คลังความรู้ข้าว กรมการข้าว");
+  a.href = "https://rkb.ricethailand.go.th";
+  a.target = "_blank";
+  a.rel = "noopener";
+  ref.appendChild(a);
+  ref.appendChild(document.createTextNode(" แล้วกรอกค่าที่ต้องการด้านบน เปลี่ยนได้ทุกระยะ"));
+  card3.appendChild(ref);
+  root.appendChild(card3);
+
+  saveR.onclick = function () {
+    var lo = parseFloat(minIn.value), hi = parseFloat(maxIn.value);
+    rangeFlash.innerHTML = "";
+    if (!isNaN(lo) && !isNaN(hi) && lo > hi) {
+      rangeFlash.appendChild(el("div", "flash flash-warn", "ค่าต่ำสุดต้องไม่มากกว่าค่าสูงสุด"));
+      return;
+    }
+    var s = WaterStore.read();
+    s.min = isNaN(lo) ? null : lo;
+    s.max = isNaN(hi) ? null : hi;
+    s.lastAlert = null;
+    WaterStore.write(s);
+    paintStatus();
+    rangeFlash.appendChild(el("div", "read-foot", "บันทึกช่วงแล้ว"));
+  };
+  clearR.onclick = function () {
+    minIn.value = "";
+    maxIn.value = "";
+    saveR.onclick();
+  };
+
+  paintStatus();
+  paintMode();
+  paintTg();
 };
 
 
