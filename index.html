@@ -7306,12 +7306,12 @@ async function pushTarget(st) {
 
 function tgConf() {
   try {
-    var c = JSON.parse(localStorage.getItem("smartrice-tg:" + Plots._uid()) || "null");
+    var c = JSON.parse(localStorage.getItem("smartrice-tg") || "null");
     return (c && typeof c === "object") ? c : {};
   } catch (e) { return {}; }
 }
 function tgSave(c) {
-  try { localStorage.setItem("smartrice-tg:" + Plots._uid(), JSON.stringify(c)); } catch (e) { /* พื้นที่เต็ม */ }
+  try { localStorage.setItem("smartrice-tg", JSON.stringify(c)); } catch (e) { /* พื้นที่เต็ม */ }
 }
 async function tgSend(text) {
   var c = tgConf();
@@ -7499,41 +7499,29 @@ views.water = function (root) {
         if (res.note) msg.appendChild(el("div", "read-foot", res.note));
       };
     } else {
-      var url = textInput("text", "https://... ที่อยู่เซนเซอร์ที่ตอบเป็น JSON", st.url || "", "min(100%,360px)");
-      var saveU = el("button", "act act-go act-sm", "บันทึกที่อยู่");
       var readNow = el("button", "act act-line act-sm", "อ่านตอนนี้");
       var r2 = rowBox();
-      r2.appendChild(labeled("ที่อยู่เซนเซอร์วัดระดับน้ำ", url));
-      r2.appendChild(saveU);
+      r2.style.marginTop = "0";
       r2.appendChild(readNow);
       modeHost.appendChild(r2);
       modeHost.appendChild(msg);
-
-      saveU.onclick = function () {
-        var s = WaterStore.read();
-        s.url = url.value.trim() || null;
-        WaterStore.write(s);
-        msg.innerHTML = "";
-        msg.appendChild(el("div", "read-foot", s.url ? "บันทึกแล้ว ระบบจะอ่านทุก 1 นาทีขณะเปิดหน้านี้" : "ลบที่อยู่แล้ว"));
-        pollSensor(true);
-      };
       readNow.onclick = function () { pollSensor(true); };
 
       msg.appendChild(el("div", "read-foot",
-        (iotConf().url
-          ? "รับระดับน้ำจากบอร์ดผ่าน Worker ที่ผู้ดูแลระบบตั้งไว้"
-          : "เซนเซอร์ต้องตอบเป็น JSON ที่มีฟิลด์ level_cm (หรือ level) หน่วยเป็นซม. หรือให้ผู้ดูแลระบบตั้งค่าเชื่อมบอร์ดที่หน้าผู้ดูแลระบบ")));
+        iotConf().url
+          ? "รับระดับน้ำจากบอร์ดอัตโนมัติทุก 1 นาทีขณะเปิดหน้านี้"
+          : "ยังไม่ได้เชื่อมบอร์ด ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ"));
 
       // อ่านเองทุก 1 นาทีขณะเปิดหน้านี้ ตัวจับเวลาจะถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
-      if (st.url || iotConf().url) {
+      if (iotConf().url) {
         pollSensor(false);
         onPageTimer(function () { pollSensor(false); }, 60000);
       }
 
       async function pollSensor(showErr) {
         var s = WaterStore.read();
-        var srcUrl = s.url || (iotConf().url ? iotConf().url.replace(/\/+$/, "") + "/level" : null);
-        if (!srcUrl) { if (showErr) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "ยังไม่ได้ใส่ที่อยู่เซนเซอร์")); } return; }
+        var srcUrl = iotConf().url ? iotConf().url.replace(/\/+$/, "") + "/level" : null;
+        if (!srcUrl) { if (showErr) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "ยังไม่ได้เชื่อมบอร์ด ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ")); } return; }
         try {
           var ctrl = new AbortController();
           var t = setTimeout(function () { ctrl.abort(); }, 8000);
@@ -7583,53 +7571,15 @@ views.water = function (root) {
     });
     tgHost.appendChild(chips);
 
-    var tok = textInput("password", "123456789:AA...", c.token || "", "min(100%,300px)");
-    var chat = textInput("text", "เช่น 123456789", c.chat || "", "170px");
-    var r = rowBox();
-    r.appendChild(labeled("Bot Token (จาก @BotFather)", tok));
-    r.appendChild(labeled("Chat ID", chat));
-    tgHost.appendChild(r);
-
-    var saveT = el("button", "act act-go act-sm", "บันทึก");
-    var test = el("button", "act act-line act-sm", "ส่งข้อความทดสอบ");
-    var r2 = rowBox();
-    r2.appendChild(saveT);
-    r2.appendChild(test);
-    tgHost.appendChild(r2);
-
-    var msg = el("div");
-    msg.style.marginTop = "10px";
-    tgHost.appendChild(msg);
-
-    function persist() {
-      tgSave({ token: tok.value.trim(), chat: chat.value.trim() });
-    }
-    saveT.onclick = function () {
-      persist();
-      msg.innerHTML = "";
-      msg.appendChild(el("div", "read-foot", "บันทึกแล้ว"));
-    };
-    test.onclick = async function () {
-      persist();
-      msg.innerHTML = "";
-      test.disabled = true;
-      try {
-        await tgSend("SmartRice AI: ทดสอบการแจ้งเตือนระดับน้ำ ใช้งานได้ตามปกติ");
-        msg.appendChild(el("div", "flash flash-ok", "ส่งข้อความทดสอบแล้ว ตรวจใน Telegram"));
-      } catch (e) {
-        msg.appendChild(el("div", "flash flash-warn", "ส่งไม่สำเร็จ: " + e.message));
-      }
-      test.disabled = false;
-    };
-
     var note = el("div", "read-foot",
       "ระบบจะแจ้งเมื่อระดับน้ำออกนอกช่วงที่ตั้งไว้ ไม่ส่งซ้ำโซนเดิมภายใน 30 นาที " +
       "การแจ้งเตือนทำงานตอนมีการบันทึกค่า (กรอกเอง หรืออ่านจากเซนเซอร์ขณะเปิดหน้านี้)");
     note.style.marginTop = "10px";
     tgHost.appendChild(note);
-    tgHost.appendChild(more("Bot Token เก็บไว้ที่ไหน",
-      "เก็บในเบราว์เซอร์ของเครื่องนี้เท่านั้น ไม่ส่งไปเซิร์ฟเวอร์ของเว็บ แต่คนที่เปิดเครื่องนี้ได้ก็อ่านค่าได้ " +
-      "ควรสร้างบอตแยกสำหรับแปลงนาโดยเฉพาะ ไม่ใช้บอตที่ผูกกับงานอื่น"));
+    if (!c.token || !c.chat) {
+      tgHost.appendChild(el("div", "flash flash-warn",
+        "ยังไม่ได้ตั้งค่า Telegram ให้ผู้ดูแลระบบตั้งที่หน้าผู้ดูแลระบบ"));
+    }
   }
 
   // ── 3) เลือกช่วงระดับน้ำ ──
@@ -12134,6 +12084,50 @@ views.admin = async function (root) {
     } catch (e) {
       wMsg.appendChild(el("div", "flash flash-warn", "เชื่อมไม่สำเร็จ: " + e.message));
     }
+  };
+
+  // ══ Telegram (แจ้งเตือนระดับน้ำจากเว็บ) ══
+  root.appendChild(bund("Telegram แจ้งเตือนระดับน้ำ"));
+  var tgCard = plot(null);
+  var tc = tgConf();
+  var tTok = iotInput("password", "123456789:AA...", tc.token || "", "min(100%,300px)");
+  var tChat = iotInput("text", "เช่น 123456789", tc.chat || "", "170px");
+  var tgRow = el("div");
+  tgRow.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap";
+  tgRow.appendChild(iotField("Bot Token (จาก @BotFather)", tTok));
+  tgRow.appendChild(iotField("Chat ID", tChat));
+  tgCard.appendChild(tgRow);
+  var tgBtns = el("div");
+  tgBtns.style.cssText = "display:flex;gap:9px;margin-top:12px;flex-wrap:wrap";
+  var tgSaveBtn = el("button", "act act-go act-sm", "บันทึก");
+  var tgTestBtn = el("button", "act act-line act-sm", "ส่งข้อความทดสอบ");
+  tgBtns.appendChild(tgSaveBtn);
+  tgBtns.appendChild(tgTestBtn);
+  tgCard.appendChild(tgBtns);
+  var tgMsg = el("div");
+  tgMsg.style.marginTop = "10px";
+  tgCard.appendChild(tgMsg);
+  tgCard.appendChild(el("div", "read-foot",
+    "เก็บในเบราว์เซอร์ของเครื่องนี้ ไม่ส่งไปเซิร์ฟเวอร์ของเว็บ ควรสร้างบอตแยกสำหรับแปลงนา " +
+    "ผู้ใช้เปิด/ปิดแจ้งเตือนได้ที่แท็บแปลงนา ส่วนระดับน้ำ"));
+  root.appendChild(tgCard);
+  function tgPersist() { tgSave({ token: tTok.value.trim(), chat: tChat.value.trim() }); }
+  tgSaveBtn.onclick = function () {
+    tgPersist();
+    tgMsg.innerHTML = "";
+    tgMsg.appendChild(el("div", "read-foot", "บันทึกแล้ว"));
+  };
+  tgTestBtn.onclick = async function () {
+    tgPersist();
+    tgMsg.innerHTML = "";
+    tgTestBtn.disabled = true;
+    try {
+      await tgSend("SmartRice AI: ทดสอบการแจ้งเตือนระดับน้ำ ใช้งานได้ตามปกติ");
+      tgMsg.appendChild(el("div", "flash flash-ok", "ส่งข้อความทดสอบแล้ว ตรวจใน Telegram"));
+    } catch (e) {
+      tgMsg.appendChild(el("div", "flash flash-warn", "ส่งไม่สำเร็จ: " + e.message));
+    }
+    tgTestBtn.disabled = false;
   };
 
   // ══ สถานะบริการ AI ══
