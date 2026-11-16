@@ -7273,15 +7273,16 @@ var WATER_STAGES = [
   { key: "ripen",    name: "ข้าวสุก ระบายน้ำ",  min: -15, max: 0 }
 ];
 
-// ที่อยู่ Worker กับรหัสอุปกรณ์ ใช้ร่วมกันทุกแปลงของผู้ใช้คนเดียว
+// ที่อยู่ Worker กับรหัสอุปกรณ์ ตั้งโดยผู้ดูแลระบบที่หน้า "ผู้ดูแลระบบ"
+// เก็บทั้งเครื่อง ไม่ผูกกับบัญชีผู้ใช้ ผู้ใช้ทั่วไปไม่เห็นช่องนี้แต่ใช้ค่าที่ตั้งไว้ได้
 function iotConf() {
   try {
-    var c = JSON.parse(localStorage.getItem("smartrice-iot:" + Plots._uid()) || "null");
+    var c = JSON.parse(localStorage.getItem("smartrice-iot") || "null");
     return (c && typeof c === "object") ? c : {};
   } catch (e) { return {}; }
 }
 function iotSave(c) {
-  try { localStorage.setItem("smartrice-iot:" + Plots._uid(), JSON.stringify(c)); } catch (e) { /* พื้นที่เต็ม */ }
+  try { localStorage.setItem("smartrice-iot", JSON.stringify(c)); } catch (e) { /* พื้นที่เต็ม */ }
 }
 
 // ส่งค่าเป้าหมายขึ้น Worker ให้บอร์ดมาดึงไปควบคุมปั๊ม/วาล์ว
@@ -7519,7 +7520,9 @@ views.water = function (root) {
       readNow.onclick = function () { pollSensor(true); };
 
       msg.appendChild(el("div", "read-foot",
-        "เซนเซอร์ต้องตอบเป็น JSON ที่มีฟิลด์ level_cm (หรือ level) หน่วยเป็นซม."));
+        (iotConf().url
+          ? "รับระดับน้ำจากบอร์ดผ่าน Worker ที่ผู้ดูแลระบบตั้งไว้"
+          : "เซนเซอร์ต้องตอบเป็น JSON ที่มีฟิลด์ level_cm (หรือ level) หน่วยเป็นซม. หรือให้ผู้ดูแลระบบตั้งค่าเชื่อมบอร์ดที่หน้าผู้ดูแลระบบ")));
 
       // อ่านเองทุก 1 นาทีขณะเปิดหน้านี้ ตัวจับเวลาจะถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
       if (st.url || iotConf().url) {
@@ -7707,39 +7710,6 @@ views.water = function (root) {
     minIn.value = "";
     maxIn.value = "";
     saveR.onclick();
-  };
-
-  // ── 4) เชื่อมบอร์ด ESP32 ผ่าน Worker ──
-  root.appendChild(bund("เชื่อมบอร์ด ESP32"));
-  var card4 = plot(null);
-  var ic = iotConf();
-  var wUrl = textInput("text", "https://ชื่อ-worker.xxx.workers.dev", ic.url || "", "min(100%,360px)");
-  var wKey = textInput("password", "รหัสอุปกรณ์ (DEVICE_KEY)", ic.key || "", "min(100%,260px)");
-  var r4 = rowBox();
-  r4.style.marginTop = "0";
-  r4.appendChild(labeled("ที่อยู่ Worker", wUrl));
-  r4.appendChild(labeled("รหัสอุปกรณ์", wKey));
-  card4.appendChild(r4);
-  var saveW = el("button", "act act-go act-sm", "บันทึกและส่งค่าให้บอร์ด");
-  var r5 = rowBox();
-  r5.appendChild(saveW);
-  card4.appendChild(r5);
-  var wMsg = el("div");
-  wMsg.style.marginTop = "10px";
-  card4.appendChild(wMsg);
-  card4.appendChild(el("div", "read-foot",
-    "โหมดอัตโนมัติ: บอร์ดดึงช่วงระดับน้ำจากเว็บ แล้วสั่งปั๊มเติมน้ำหรือวาล์วระบายเองให้อยู่ในช่วง " +
-    "ค่าระดับน้ำที่บอร์ดวัดจะส่งกลับมาแสดงที่ส่วนบนของหน้านี้โดยไม่ต้องกรอก"));
-  root.appendChild(card4);
-  saveW.onclick = async function () {
-    iotSave({ url: wUrl.value.trim(), key: wKey.value.trim() });
-    wMsg.innerHTML = "";
-    try {
-      var m = await pushTarget(WaterStore.read());
-      wMsg.appendChild(el("div", m ? "flash flash-ok" : "read-foot", m || "บันทึกแล้ว"));
-    } catch (e) {
-      wMsg.appendChild(el("div", "flash flash-warn", "เชื่อมไม่สำเร็จ: " + e.message));
-    }
   };
 
   paintStatus();
@@ -12117,6 +12087,54 @@ views.profile = function (root) {
 };
 
 views.admin = async function (root) {
+
+  // ══ เชื่อมบอร์ด ESP32 (IoT) ══
+  //
+  // ที่อยู่ Worker กับรหัสอุปกรณ์ตั้งที่นี่ที่เดียว หน้าแปลงนาไม่มีช่องนี้
+  // เก็บในเบราว์เซอร์ของเครื่องนี้ ไม่ผูกกับบัญชีผู้ใช้อื่น
+  root.appendChild(bund("เชื่อมบอร์ด ESP32 (IoT)"));
+  var iotCard = plot(null);
+  var ic = iotConf();
+  function iotInput(type, ph, val, w) {
+    var i = el("input");
+    i.type = type; i.placeholder = ph; i.autocomplete = "off";
+    i.style.cssText = "padding:9px 12px;border:1px solid var(--rule);border-radius:var(--r-sm);width:" + w;
+    if (val) i.value = val;
+    return i;
+  }
+  function iotField(label, node) {
+    var b = el("div");
+    b.appendChild(el("div", "read-foot", label));
+    b.appendChild(node);
+    return b;
+  }
+  var wUrl = iotInput("text", "https://ชื่อ-worker.xxx.workers.dev", ic.url || "", "min(100%,360px)");
+  var wKey = iotInput("password", "รหัสอุปกรณ์ (DEVICE_KEY)", ic.key || "", "min(100%,260px)");
+  var iotRow = el("div");
+  iotRow.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap";
+  iotRow.appendChild(iotField("ที่อยู่ Worker", wUrl));
+  iotRow.appendChild(iotField("รหัสอุปกรณ์", wKey));
+  iotCard.appendChild(iotRow);
+  var saveW = el("button", "act act-go act-sm", "บันทึกและส่งค่าให้บอร์ด");
+  saveW.style.marginTop = "12px";
+  iotCard.appendChild(saveW);
+  var wMsg = el("div");
+  wMsg.style.marginTop = "10px";
+  iotCard.appendChild(wMsg);
+  iotCard.appendChild(el("div", "read-foot",
+    "ส่วนระดับน้ำในแท็บแปลงนาจะใช้ค่านี้ส่งช่วงระดับน้ำให้บอร์ดและดึงระดับน้ำที่บอร์ดวัดมาแสดง " +
+    "ค่านี้อยู่ในเบราว์เซอร์ของเครื่องนี้ ถ้าเปิดเว็บจากเครื่องอื่นต้องตั้งซ้ำที่เครื่องนั้น"));
+  root.appendChild(iotCard);
+  saveW.onclick = async function () {
+    iotSave({ url: wUrl.value.trim(), key: wKey.value.trim() });
+    wMsg.innerHTML = "";
+    try {
+      var m = await pushTarget(WaterStore.read());
+      wMsg.appendChild(el("div", m ? "flash flash-ok" : "read-foot", m || "บันทึกแล้ว"));
+    } catch (e) {
+      wMsg.appendChild(el("div", "flash flash-warn", "เชื่อมไม่สำเร็จ: " + e.message));
+    }
+  };
 
   // ══ สถานะบริการ AI ══
   //
