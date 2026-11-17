@@ -7263,7 +7263,7 @@ views.season = function (root) {
 var WaterStore = {
   read: function () {
     var v = null;
-    try { v = JSON.parse(localStorage.getItem(plotKey("water")) || "null"); } catch (e) { v = null; }
+    try { v = JSON.parse(localStorage.getItem(plotKey("water") + ":device:" + (iotConf().device_id || "none")) || "null"); } catch (e) { v = null; }
     if (!v || typeof v !== "object") v = {};
     if (!Array.isArray(v.log)) v.log = [];
     if (v.mode !== "auto") v.mode = "manual";
@@ -7271,7 +7271,7 @@ var WaterStore = {
   },
   write: function (v) {
     v.log = v.log.slice(-200);
-    try { localStorage.setItem(plotKey("water"), JSON.stringify(v)); } catch (e) { /* พื้นที่เต็ม */ }
+    try { localStorage.setItem(plotKey("water") + ":device:" + (iotConf().device_id || "none"), JSON.stringify(v)); } catch (e) { /* พื้นที่เต็ม */ }
   }
 };
 
@@ -7294,24 +7294,35 @@ function iotAccountKey() { return "smartrice-iot:" + encodeURIComponent(Session.
 function iotConf() {
   var c = {};
   try { c = JSON.parse(localStorage.getItem(iotAccountKey()) || "null") || {}; } catch (e) {}
-  return { url: c.url || IOT_DEFAULT_URL };
+  return { url: c.url || IOT_DEFAULT_URL, device_id: c.device_id || "" };
 }
-function iotHeaders() { return Session.headers({ "Content-Type": "application/json" }); }
+function iotHeaders(deviceId) {
+  var h = Session.headers({ "Content-Type": "application/json" });
+  if (deviceId) h["X-Device-Id"] = deviceId;
+  return h;
+}
 function iotSave(c) {
   var url = new URL(c.url || IOT_DEFAULT_URL);
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || url.pathname !== "/")
     throw new Error("ใช้ HTTPS Worker origin เท่านั้น");
-  localStorage.setItem(iotAccountKey(), JSON.stringify({ url: url.origin }));
+  var id = c.device_id === undefined ? iotConf().device_id : c.device_id;
+  if (id && !/^sr_[a-f0-9]{32}$/.test(id)) throw new Error("Device ID ไม่ถูกต้อง");
+  localStorage.setItem(iotAccountKey(), JSON.stringify({ url: url.origin, device_id: id || "" }));
 }
 async function iotRequest(path, options) {
   var ctrl = new AbortController();
   var timer = setTimeout(function () { ctrl.abort(); }, 8000);
   try {
-    var c = iotConf(), url = new URL(c.url);
+    var c = iotConf(), url = new URL(c.url), accountToken = Session.token;
+    var management = path.split("?")[0] === "/devices";
+    if (!management && !c.device_id) throw new Error("เลือกหรือเพิ่มอุปกรณ์ของคุณก่อน");
     if (url.protocol !== "https:" || url.username || url.password) throw new Error("Worker ต้องใช้ HTTPS");
-    var init = Object.assign({}, options || {}, { headers: iotHeaders(), signal: ctrl.signal, cache: "no-store", redirect: "error" });
+    var init = Object.assign({}, options || {}, { headers: iotHeaders(management ? "" : c.device_id), signal: ctrl.signal, cache: "no-store", redirect: "error" });
     var res = await fetch(url.origin + path, init);
     var d = await res.json();
+    if (Session.token !== accountToken || (!management && iotConf().device_id !== c.device_id))
+      throw new Error("เปลี่ยนบัญชีหรืออุปกรณ์ระหว่างรอ กรุณาลองใหม่");
+    if (res.ok && !management && d.device_id !== c.device_id) throw new Error("ข้อมูลตอบกลับไม่ตรงอุปกรณ์");
     if (res.status === 401) throw new Error("ยืนยันตัวตนไม่ผ่าน กรุณาเข้าสู่ระบบใหม่");
     if (!res.ok) throw new Error(d.error || ("HTTP " + res.status));
     return d;
@@ -7368,6 +7379,7 @@ function waterWhen(ts) {
 // บันทึกค่าหนึ่งครั้ง แล้วส่ง Telegram ถ้าออกนอกช่วง
 // ไม่ส่งซ้ำโซนเดิมภายใน 30 นาที ไม่งั้นโหมดอัตโนมัติจะยิงข้อความทุกนาทีจนผู้ใช้ปิดแจ้งเตือนทิ้ง
 async function recordWater(level, source, measuredAt) {
+  var initialAccount = iotAccountKey(), initialDevice = iotConf().device_id;
   var st = WaterStore.read();
   var now = Date.now();
   st.log.push({ v: level, at: measuredAt || now, src: source });
@@ -7393,7 +7405,7 @@ async function recordWater(level, source, measuredAt) {
   } else if (zone === "ok") {
     st.lastAlert = null;   // กลับเข้าช่วงแล้ว ครั้งหน้าที่หลุดช่วงต้องแจ้งทันที
   }
-  WaterStore.write(st);
+  if (initialAccount === iotAccountKey() && initialDevice === iotConf().device_id) WaterStore.write(st);
   return { zone: zone, note: note };
 }
 
@@ -7429,6 +7441,80 @@ views.water = function (root) {
     r.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap;margin-top:12px";
     return r;
   }
+
+  // Every signed-in user can provision their own device; ownership is assigned server-side.
+  root.appendChild(bund("อุปกรณ์ของฉัน"));
+  var deviceCard = plot(null), deviceList = el("select"), deviceFlash = el("div"), secretHost = el("div");
+  deviceList.setAttribute("aria-label", "เลือกอุปกรณ์ของฉัน");
+  deviceList.style.cssText = "padding:9px;max-width:100%;border:1px solid var(--rule);border-radius:var(--r-sm)";
+  var deviceRow = rowBox(), refreshDevices = el("button", "act act-line act-sm", "โหลดอุปกรณ์ใหม่");
+  var moreDevices = el("button", "act act-line act-sm", "โหลดอุปกรณ์เพิ่ม"), nextCursor = null, loadedDevices = [];
+  moreDevices.hidden = true;
+  deviceRow.appendChild(deviceList); deviceRow.appendChild(refreshDevices); deviceRow.appendChild(moreDevices);
+  deviceCard.appendChild(deviceRow);
+  deviceCard.appendChild(el("div", "read-foot", "เลือกบอร์ดของคุณก่อนตั้งระดับน้ำหรือสั่งปั๊ม อุปกรณ์แต่ละตัวมีข้อมูลและคำสั่งแยกกัน"));
+  var nameInput = textInput("text", "เช่น บอร์ดแปลงหลังบ้าน", "", "min(100%,300px)");
+  var addDevice = el("button", "act act-go act-sm", "เพิ่มอุปกรณ์"), createRow = rowBox();
+  createRow.appendChild(labeled("ชื่ออุปกรณ์ใหม่", nameInput)); createRow.appendChild(addDevice);
+  deviceCard.appendChild(createRow); deviceCard.appendChild(deviceFlash); deviceCard.appendChild(secretHost);
+  root.appendChild(deviceCard);
+  function drawDeviceList() {
+    var selected = iotConf().device_id;
+    deviceList.innerHTML = "";
+    var empty = el("option", "", "— เลือกอุปกรณ์ —"); empty.value = ""; deviceList.appendChild(empty);
+    loadedDevices.forEach(function (d) { var o = el("option", "", d.name + " · " + d.id.slice(-8)); o.value = d.id; deviceList.appendChild(o); });
+    if (selected && !loadedDevices.some(function (d) { return d.id === selected; })) {
+      var current = el("option", "", "อุปกรณ์ที่เลือก · " + selected.slice(-8)); current.value = selected; deviceList.appendChild(current);
+    }
+    deviceList.value = selected;
+  }
+  async function loadDevices(append) {
+    refreshDevices.disabled = moreDevices.disabled = true;
+    try {
+      var data = await iotRequest("/devices" + (append && nextCursor ? "?cursor=" + encodeURIComponent(nextCursor) : ""));
+      loadedDevices = (append ? loadedDevices : []).concat(data.devices || []).filter(function (d, i, all) {
+        return /^sr_[a-f0-9]{32}$/.test(d.id) && all.findIndex(function (x) { return x.id === d.id; }) === i;
+      });
+      nextCursor = data.cursor || null; moreDevices.hidden = !nextCursor;
+      drawDeviceList(); deviceFlash.textContent = loadedDevices.length ? "" : "ยังไม่มีอุปกรณ์ กดเพิ่มอุปกรณ์เพื่อเริ่มต้น";
+    } catch (e) { deviceFlash.textContent = "โหลดอุปกรณ์ไม่ได้: " + e.message; }
+    finally { refreshDevices.disabled = moreDevices.disabled = false; }
+  }
+  deviceList.onchange = function () { iotSave({ url: iotConf().url, device_id: deviceList.value }); open(here); };
+  refreshDevices.onclick = function () { loadDevices(false); };
+  moreDevices.onclick = function () { loadDevices(true); };
+  addDevice.onclick = async function () {
+    addDevice.disabled = true; deviceFlash.textContent = "";
+    try {
+      var result = await iotRequest("/devices", { method: "POST", body: JSON.stringify({ name: nameInput.value.trim() }) });
+      if (!result.device || !/^sr_[a-f0-9]{32}$/.test(result.device.id) || !/^[a-f0-9]{64}$/.test(result.device_key))
+        throw new Error("Worker ส่งข้อมูลอุปกรณ์ไม่ครบ");
+      secretHost.innerHTML = "";
+      secretHost.appendChild(el("div", "flash flash-warn", "บันทึกกุญแจด้านล่างตอนนี้ กุญแจแสดงเฉพาะตอนสร้างและจะหายเมื่อเปลี่ยนหน้า ห้ามส่งให้คนอื่น"));
+      var idBox = textInput("text", "Device ID", result.device.id), keyBox = textInput("password", "Device Key", result.device_key);
+      idBox.readOnly = keyBox.readOnly = true;
+      secretHost.appendChild(labeled("SR_DEVICE_ID", idBox)); secretHost.appendChild(labeled("SR_DEVICE_KEY", keyBox));
+      var reveal = el("button", "act act-line act-sm", "แสดง/ซ่อนกุญแจ");
+      reveal.onclick = function () { keyBox.type = keyBox.type === "password" ? "text" : "password"; }; secretHost.appendChild(reveal);
+      var saveConfig = el("button", "act act-go act-sm", "ดาวน์โหลด smartrice_config.h");
+      saveConfig.onclick = function () {
+        var config = '#pragma once\n#define SR_DEVICE_ID "' + result.device.id + '"\n#define SR_DEVICE_KEY "' + result.device_key + '"\n' +
+          '#define SR_WIFI_SSID ""\n#define SR_WIFI_PASSWORD ""\n#define SR_ROOT_CA_PEM ""\n' +
+          '#define SR_HARDWARE_CONFIRMED false\n#define SR_RELAY_ACTIVE_LOW true\n#define SR_MOUNT_HEIGHT_CM 0.0f\n';
+        var url = URL.createObjectURL(new Blob([config], { type: "text/plain;charset=utf-8" }));
+        var a = document.createElement("a"); a.href = url; a.download = "smartrice_config.h"; a.click(); setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      };
+      secretHost.appendChild(saveConfig);
+      secretHost.appendChild(el("div", "read-foot", "ไฟล์ตั้งค่านี้มีเฉพาะ ID/กุญแจ ต้องเติม Wi-Fi, TLS CA และตรวจฮาร์ดแวร์ก่อนแฟลช"));
+      var useDevice = el("button", "act act-line act-sm", "บันทึกกุญแจแล้ว เลือกอุปกรณ์นี้");
+      useDevice.onclick = function () { iotSave({ url: iotConf().url, device_id: result.device.id }); open(here); };
+      secretHost.appendChild(useDevice);
+      loadedDevices.push(result.device); drawDeviceList(); nameInput.value = "";
+      deviceFlash.textContent = "สร้างอุปกรณ์แล้ว ดาวน์โหลดไฟล์ตั้งค่าก่อนเลือกอุปกรณ์หรือเปลี่ยนหน้า";
+    } catch (e) { deviceFlash.textContent = "เพิ่มอุปกรณ์ไม่สำเร็จ: " + e.message; }
+    finally { addDevice.disabled = false; }
+  };
+  drawDeviceList(); loadDevices(false);
 
   // ── 1) ระดับน้ำ + เลือกโหมด ──
   root.appendChild(bund("ระดับน้ำในแปลงนา"));
@@ -7490,7 +7576,8 @@ views.water = function (root) {
     wrap.style.marginTop = "16px";
 
     var value, foot;
-    if (!iot.url) { value = "ยังไม่ได้เชื่อมบอร์ด"; foot = "ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ"; }
+    if (!iot.device_id) { value = "ยังไม่ได้เลือกอุปกรณ์"; foot = "เพิ่มหรือเลือกอุปกรณ์ของคุณด้านบน"; }
+    else if (!iot.url) { value = "ยังไม่ได้เชื่อมบอร์ด"; foot = "ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ"; }
     else if (!ps || !ps.known) { value = "ยังไม่ทราบสถานะ"; foot = "รอรับข้อมูลจากบอร์ด"; }
     else { value = ps.on ? "เปิดอยู่" : "ปิดอยู่"; foot = "คำสั่งรีเลย์จากบอร์ดเมื่อ " + waterWhen(ps.at); }
     wrap.appendChild(readOut("สถานะปั๊ม", value, foot));
@@ -7508,14 +7595,14 @@ views.water = function (root) {
       box.style.cssText = "display:flex;gap:9px;margin-top:12px;flex-wrap:wrap";
       var onBtn = el("button", "act act-go act-sm", "เปิดปั๊ม");
       var offBtn = el("button", "act act-line act-sm", "ปิดปั๊ม");
-      offBtn.disabled = !iot.url;
-      onBtn.disabled = !iot.url || !ps || !ps.known || Date.now() - ps.at > 45000 || !!ps.fault || ps.status !== "ready";
+      offBtn.disabled = !iot.url || !iot.device_id;
+      onBtn.disabled = !iot.url || !iot.device_id || !ps || !ps.known || Date.now() - ps.at > 45000 || !!ps.fault || ps.status !== "ready";
       onBtn.onclick = function () { sendPump("on", onBtn, offBtn); };
       offBtn.onclick = function () { sendPump("off", onBtn, offBtn); };
       box.appendChild(onBtn);
       box.appendChild(offBtn);
       wrap.appendChild(box);
-      var hint = el("div", "read-foot", "บอร์ดทำตามภายใน 15 วินาที ปั๊มที่เปิดด้วยมือจะปิดเองเมื่อครบ 10 นาที");
+      var hint = el("div", "read-foot", "บอร์ดตรวจคำสั่งทุกประมาณ 15 วินาที เครือข่ายอาจทำให้ช้าลง คำสั่งเปิดหมดอายุภายใน 10 นาที");
       hint.style.marginTop = "8px";
       wrap.appendChild(hint);
     } else {
@@ -7532,8 +7619,8 @@ views.water = function (root) {
     try {
       await iotRequest("/pump", { method: "POST", body: JSON.stringify({ cmd: cmd }) });
       note(el("div", "flash flash-ok", cmd === "on"
-        ? "สั่งเปิดปั๊มแล้ว รอบอร์ดตอบรับไม่เกิน 15 วินาที"
-        : "สั่งปิดปั๊มแล้ว รอบอร์ดตอบรับไม่เกิน 15 วินาที"));
+        ? "ส่งคำสั่งเปิดแล้ว รอสถานะรีเลย์จากบอร์ดยืนยัน"
+        : "ส่งคำสั่งปิดแล้ว รอสถานะรีเลย์จากบอร์ดยืนยัน"));
     } catch (e) {
       note(el("div", "flash flash-warn", "สั่งปั๊มไม่สำเร็จ: " +
         (e.message === "Failed to fetch" ? "ติดต่อ Worker ไม่ได้ ตรวจอินเทอร์เน็ตและที่อยู่ Worker" : e.message)));
@@ -7646,33 +7733,36 @@ views.water = function (root) {
   root.appendChild(card2);
 
   function paintTg() {
-    var st = WaterStore.read();
-    var c = tgConf();
     tgHost.innerHTML = "";
-
-    var chips = el("div", "mchips");
-    [[true, "เปิดแจ้งเตือน"], [false, "ปิด"]].forEach(function (o) {
-      var b = el("button", "act act-sm " + (!!st.tg === o[0] ? "act-go" : "act-line"), o[1]);
-      b.onclick = function () {
-        var s = WaterStore.read();
-        s.tg = o[0];
-        if (!o[0]) s.lastAlert = null;
-        WaterStore.write(s);
-        paintTg();
-      };
-      chips.appendChild(b);
-    });
-    tgHost.appendChild(chips);
-
-    var note = el("div", "read-foot",
-      "ระบบจะแจ้งเมื่อระดับน้ำออกนอกช่วงที่ตั้งไว้ ไม่ส่งซ้ำโซนเดิมภายใน 30 นาที " +
-      "การแจ้งเตือนทำงานตอนมีการบันทึกค่า (กรอกเอง หรืออ่านจากเซนเซอร์ขณะเปิดหน้านี้)");
-    note.style.marginTop = "10px";
-    tgHost.appendChild(note);
-    if (!c.worker) {
-      tgHost.appendChild(el("div", "flash flash-warn",
-        "ยังไม่ได้ตั้งค่า Telegram ให้ผู้ดูแลระบบตั้งที่หน้าผู้ดูแลระบบ"));
-    }
+    var selected = iotConf().device_id;
+    if (!selected) { tgHost.appendChild(el("div", "read-foot", "เลือกอุปกรณ์ก่อนตั้งค่า Telegram")); return; }
+    var chat = textInput("text", "Chat ID ของคุณ เช่น 123456789", "", "min(100%,300px)");
+    var enabled = el("input"); enabled.type = "checkbox";
+    var enabledLabel = el("label", "", " เปิดแจ้งเตือนสำหรับอุปกรณ์นี้ "); enabledLabel.prepend(enabled);
+    var save = el("button", "act act-go act-sm", "บันทึก Telegram");
+    var test = el("button", "act act-line act-sm", "ทดสอบ Telegram"), msg = el("div");
+    tgHost.appendChild(enabledLabel); tgHost.appendChild(labeled("Telegram Chat ID ของคุณ", chat));
+    tgHost.appendChild(save); tgHost.appendChild(test); tgHost.appendChild(msg);
+    tgHost.appendChild(el("div", "read-foot", "เริ่มคุยกับบอตของระบบก่อน ใส่เฉพาะ Chat ID ที่คุณมีสิทธิ์ใช้ ระบบไม่ใช้ TG_CHAT ส่วนกลางส่งข้อมูลของทุกบัญชี"));
+    save.disabled = test.disabled = true;
+    iotRequest("/telegram").then(function (d) {
+      chat.value = d.chat_id; enabled.checked = d.enabled; save.disabled = test.disabled = false;
+    }).catch(function (e) { msg.textContent = "โหลดค่า Telegram ไม่สำเร็จ: " + e.message; });
+    save.onclick = async function () {
+      save.disabled = true;
+      try {
+        await iotRequest("/telegram", { method: "POST", body: JSON.stringify({ enabled: enabled.checked, chat_id: chat.value.trim() }) });
+        var st = WaterStore.read(); st.tg = enabled.checked; WaterStore.write(st);
+        msg.textContent = "บันทึกปลายทาง Telegram ของอุปกรณ์นี้แล้ว";
+      } catch (e) { msg.textContent = e.message; }
+      finally { save.disabled = false; }
+    };
+    test.onclick = async function () {
+      test.disabled = true;
+      try { await tgSend("SmartRice ทดสอบแจ้งเตือนอุปกรณ์ของคุณ"); msg.textContent = "ส่งข้อความทดสอบแล้ว"; }
+      catch (e) { msg.textContent = e.message; }
+      finally { test.disabled = false; }
+    };
   }
 
   // ── 3) เลือกช่วงระดับน้ำ ──
@@ -7701,7 +7791,6 @@ views.water = function (root) {
     WATER_STAGES.forEach(function (g) {
       var b = el("button", "act act-sm " + (cur === g.key ? "act-go" : "act-line"), g.name);
       b.onclick = function () {
-        var s = WaterStore.read();
         pendingStage = g.key;
         minIn.value = String(g.min);
         maxIn.value = String(g.max);
@@ -7760,7 +7849,7 @@ views.water = function (root) {
   paintTg();
 
   // เชื่อมบอร์ดแล้ว อ่านทุก 15 วินาทีขณะเปิดหน้านี้ ตัวจับเวลาถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
-  if (iotConf().url) {
+  if (iotConf().url && iotConf().device_id) {
     pollSensor(false);
     onPageTimer(function () { pollSensor(false); }, 15000);
   }
@@ -12201,10 +12290,10 @@ views.admin = async function (root) {
   // ══ Telegram (แจ้งเตือนระดับน้ำจากเว็บ) ══
   root.appendChild(bund("Telegram แจ้งเตือนระดับน้ำ"));
   var tgCard = plot(null);
-  tgCard.appendChild(el("div", "read-foot", "ตั้ง TG_TOKEN และ TG_CHAT ใน Cloudflare Worker Secrets เท่านั้น เว็บไม่เก็บ Bot Token"));
+  tgCard.appendChild(el("div", "read-foot", "ตั้ง TG_TOKEN ใน Worker Secrets; ผู้ใช้ตั้ง Chat ID แยกอุปกรณ์ที่ ข้อมูลการเกษตร → ระดับน้ำ → Telegram เว็บไม่เก็บ Bot Token"));
   var tgBtns = el("div");
   tgBtns.style.cssText = "display:flex;gap:9px;margin-top:12px;flex-wrap:wrap";
-  var tgSaveBtn = el("button", "act act-go act-sm", "บันทึก");
+  var tgSaveBtn = el("button", "act act-go act-sm", "ตั้งค่าที่หน้าระดับน้ำ");
   var tgTestBtn = el("button", "act act-line act-sm", "ส่งข้อความทดสอบ");
   tgBtns.appendChild(tgSaveBtn);
   tgBtns.appendChild(tgTestBtn);
@@ -12217,10 +12306,10 @@ views.admin = async function (root) {
     "ผู้ใช้เปิด/ปิดแจ้งเตือนได้ที่แท็บแปลงนา ส่วนระดับน้ำ"));
   root.appendChild(tgCard);
   function tgPersist() { tgSave(); }
-  tgSaveBtn.onclick = function () {
-    tgPersist();
-    tgMsg.innerHTML = "";
-    tgMsg.appendChild(el("div", "read-foot", "บันทึกแล้ว"));
+  tgSaveBtn.onclick = async function () {
+    await open("field");
+    var jump = Array.from(document.querySelectorAll("button")).find(function (b) { return b.textContent === "ระดับน้ำ"; });
+    if (jump) jump.click();
   };
   tgTestBtn.onclick = async function () {
     tgPersist();
