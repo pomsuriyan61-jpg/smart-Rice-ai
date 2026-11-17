@@ -7286,13 +7286,20 @@ var WATER_STAGES = [
   { key: "ripen",    name: "ข้าวสุก ระบายน้ำ",  min: -15, max: 0 }
 ];
 
-// ที่อยู่ Worker กับรหัสอุปกรณ์ ตั้งโดยผู้ดูแลระบบที่หน้า "ผู้ดูแลระบบ"
-// เก็บทั้งเครื่อง ไม่ผูกกับบัญชีผู้ใช้ ผู้ใช้ทั่วไปไม่เห็นช่องนี้แต่ใช้ค่าที่ตั้งไว้ได้
+// ที่อยู่ Worker ของบอร์ด ฝังค่าตั้งต้นไว้ในโค้ด (ที่อยู่ไม่ใช่ความลับ) จึงไม่หายเมื่อเข้าจากเครื่องใหม่
+// ผู้ดูแลระบบเปลี่ยนได้ที่หน้าผู้ดูแลระบบ ค่าที่เปลี่ยนเก็บเฉพาะในเครื่องนั้น
+// การยืนยันตัวตนใช้ token ล็อกอินของผู้ใช้ ไม่ต้องเก็บรหัสอุปกรณ์ไว้ในเบราว์เซอร์
+var IOT_DEFAULT_URL = "https://smartrice-iot.pomsuriyan61.workers.dev";
 function iotConf() {
-  try {
-    var c = JSON.parse(localStorage.getItem("smartrice-iot") || "null");
-    return (c && typeof c === "object") ? c : {};
-  } catch (e) { return {}; }
+  var c = {};
+  try { c = JSON.parse(localStorage.getItem("smartrice-iot") || "null") || {}; } catch (e) { c = {}; }
+  return { url: c.url || IOT_DEFAULT_URL, key: c.key || "" };
+}
+function iotHeaders() {
+  var h = Session.headers({ "Content-Type": "application/json" });
+  var k = iotConf().key;
+  if (k) h["X-Key"] = k;   // ใส่เฉพาะกรณีเคยตั้งรหัสไว้ (เข้ากันได้กับเวอร์ชันเดิม)
+  return h;
 }
 function iotSave(c) {
   try { localStorage.setItem("smartrice-iot", JSON.stringify(c)); } catch (e) { /* พื้นที่เต็ม */ }
@@ -7302,10 +7309,10 @@ function iotSave(c) {
 // auto=false แปลว่าโหมดควบคุมเอง บอร์ดจะหยุดสั่งงานทั้งหมด
 async function pushTarget(st) {
   var c = iotConf();
-  if (!c.url || !c.key) return null;
+  if (!c.url) return null;
   var res = await fetch(c.url.replace(/\/+$/, "") + "/target", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Key": c.key },
+    headers: iotHeaders(),
     body: JSON.stringify({
       min: typeof st.min === "number" ? st.min : null,
       max: typeof st.max === "number" ? st.max : null,
@@ -7313,6 +7320,7 @@ async function pushTarget(st) {
       auto: st.mode === "auto"
     })
   });
+  if (res.status === 401) throw new Error("ยืนยันตัวตนกับ Worker ไม่ผ่าน ลองออกจากระบบแล้วเข้าใหม่");
   if (!res.ok) throw new Error("Worker ตอบ HTTP " + res.status);
   return st.mode === "auto" ? "ส่งค่าเป้าหมายให้บอร์ดแล้ว (บอร์ดควบคุมน้ำอัตโนมัติ)" : "ส่งแล้ว: โหมดควบคุมเอง บอร์ดจะไม่สั่งงาน";
 }
@@ -7526,10 +7534,10 @@ views.water = function (root) {
     try {
       var res = await fetch(iot.url.replace(/\/+$/, "") + "/pump", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Key": iot.key || "" },
+        headers: iotHeaders(),
         body: JSON.stringify({ cmd: cmd })
       });
-      if (res.status === 401) throw new Error("รหัสอุปกรณ์ไม่ตรง ให้ผู้ดูแลระบบตรวจที่หน้าผู้ดูแลระบบ");
+      if (res.status === 401) throw new Error("ยืนยันตัวตนกับ Worker ไม่ผ่าน ลองออกจากระบบแล้วเข้าใหม่");
       if (!res.ok) throw new Error("Worker ตอบ HTTP " + res.status);
       note(el("div", "flash flash-ok", cmd === "on"
         ? "สั่งเปิดปั๊มแล้ว รอบอร์ดตอบรับไม่เกิน 15 วินาที"
@@ -7637,7 +7645,7 @@ views.water = function (root) {
     if (!iot.url) return;
     await fetch(iot.url.replace(/\/+$/, "") + "/pump", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Key": iot.key || "" },
+      headers: iotHeaders(),
       body: JSON.stringify({ cmd: cmd })
     });
   }
@@ -12177,11 +12185,9 @@ views.admin = async function (root) {
     return b;
   }
   var wUrl = iotInput("text", "https://ชื่อ-worker.xxx.workers.dev", ic.url || "", "min(100%,360px)");
-  var wKey = iotInput("password", "รหัสอุปกรณ์ (DEVICE_KEY)", ic.key || "", "min(100%,260px)");
   var iotRow = el("div");
   iotRow.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap";
   iotRow.appendChild(iotField("ที่อยู่ Worker", wUrl));
-  iotRow.appendChild(iotField("รหัสอุปกรณ์", withToggle(wKey)));
   iotCard.appendChild(iotRow);
   var saveW = el("button", "act act-go act-sm", "บันทึกและส่งค่าให้บอร์ด");
   saveW.style.marginTop = "12px";
@@ -12191,10 +12197,11 @@ views.admin = async function (root) {
   iotCard.appendChild(wMsg);
   iotCard.appendChild(el("div", "read-foot",
     "ส่วนระดับน้ำในแท็บแปลงนาจะใช้ค่านี้ส่งช่วงระดับน้ำให้บอร์ดและดึงระดับน้ำที่บอร์ดวัดมาแสดง " +
-    "ค่านี้อยู่ในเบราว์เซอร์ของเครื่องนี้ ถ้าเปิดเว็บจากเครื่องอื่นต้องตั้งซ้ำที่เครื่องนั้น"));
+    "เว็บยืนยันตัวตนกับ Worker ด้วยการล็อกอิน ไม่ต้องใส่รหัสอุปกรณ์ และใช้ได้ทุกเครื่องที่ล็อกอิน " +
+    "ที่อยู่นี้มีค่าตั้งต้นในโค้ดอยู่แล้ว เปลี่ยนเฉพาะเมื่อย้าย Worker"));
   root.appendChild(iotCard);
   saveW.onclick = async function () {
-    iotSave({ url: wUrl.value.trim(), key: wKey.value.trim() });
+    iotSave({ url: wUrl.value.trim() });
     wMsg.innerHTML = "";
     try {
       var m = await pushTarget(WaterStore.read());
