@@ -4499,11 +4499,24 @@ function setFieldVarietyKey(k) {
   writeField(f);
 }
 
+// "2026-09-01" ต้องเป็นเที่ยงคืนของวันนั้นตามเวลาเครื่อง
+// new Date("2026-09-01") ให้เที่ยงคืน UTC ซึ่งในไทยคือ 07:00 ทำให้อายุข้าวและวันที่คำนวณเพี้ยนไป 1 วันได้
+function isoToLocalDate(iso) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  var d = new Date(iso);
+  return isNaN(d.getTime()) ? null : d;
+}
+function localDateToIso(d) {
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" +
+         String(d.getDate()).padStart(2, "0");
+}
+
 function fieldSowDate() {
   var f = readField();
   if (!f || !f.sowDate) return null;
-  var d = new Date(f.sowDate);
-  return isNaN(d.getTime()) ? null : d;
+  var d = isoToLocalDate(f.sowDate);
+  return (d && !isNaN(d.getTime())) ? d : null;
 }
 
 function setFieldSowDate(iso) {
@@ -7171,7 +7184,7 @@ views.season = function (root) {
   dIn.type = "date";
   dIn.style.cssText = "padding:9px 12px;border:1px solid var(--rule);border-radius:var(--r-sm)";
   var sd = fieldSowDate();
-  if (sd) dIn.value = sd.toISOString().slice(0, 10);
+  if (sd) dIn.value = localDateToIso(sd);
   dBox.appendChild(dIn);
   row.appendChild(dBox);
 
@@ -7197,7 +7210,7 @@ views.season = function (root) {
     var k = kSel.value;
     if (!k || !dIn.value) return;
     var v = window.findVariety(k);
-    var cal = window.varietyCalendar(k, new Date(dIn.value));
+    var cal = window.varietyCalendar(k, isoToLocalDate(dIn.value));
     if (!cal) return;
 
     var g = el("div", "row-3");
@@ -7420,9 +7433,19 @@ views.water = function (root) {
   var card1 = plot(null);
   statusHost = el("div");
   card1.appendChild(statusHost);
+  var pumpHost = el("div");
+  card1.appendChild(pumpHost);
   modeHost = el("div");
   card1.appendChild(modeHost);
+  var noteHost = el("div");
+  noteHost.style.marginTop = "10px";
+  card1.appendChild(noteHost);
   root.appendChild(card1);
+
+  function note(node) {
+    noteHost.innerHTML = "";
+    if (node) noteHost.appendChild(node);
+  }
 
   function paintStatus() {
     var st = WaterStore.read();
@@ -7453,11 +7476,118 @@ views.water = function (root) {
     }
   }
 
+  function paintAll() { paintStatus(); paintPump(); }
+
+  // สถานะปั๊มมาจากบอร์ดเท่านั้น ไม่เดาจากคำสั่งที่เพิ่งกด
+  function paintPump() {
+    var st = WaterStore.read();
+    var ps = st.pumpState;
+    var iot = iotConf();
+    pumpHost.innerHTML = "";
+    var wrap = el("div");
+    wrap.style.marginTop = "16px";
+
+    var value, foot;
+    if (!iot.url) { value = "ยังไม่ได้เชื่อมบอร์ด"; foot = "ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ"; }
+    else if (!ps || !ps.known) { value = "ยังไม่ทราบสถานะ"; foot = "รอรับข้อมูลจากบอร์ด"; }
+    else { value = ps.on ? "เปิดอยู่" : "ปิดอยู่"; foot = "ข้อมูลจากบอร์ดเมื่อ " + waterWhen(ps.at); }
+    wrap.appendChild(readOut("สถานะปั๊ม", value, foot));
+
+    if (ps && ps.known && Date.now() - ps.at > 120000) {
+      wrap.appendChild(el("div", "flash flash-warn",
+        "บอร์ดไม่ส่งข้อมูลมานานกว่า 2 นาที สถานะที่เห็นอาจไม่ตรงกับปั๊มจริง ตรวจไฟและ WiFi ของบอร์ด"));
+    }
+
+    if (st.mode === "manual") {
+      var box = el("div");
+      box.style.cssText = "display:flex;gap:9px;margin-top:12px;flex-wrap:wrap";
+      var onBtn = el("button", "act act-go act-sm", "เปิดปั๊ม");
+      var offBtn = el("button", "act act-line act-sm", "ปิดปั๊ม");
+      onBtn.disabled = offBtn.disabled = !iot.url;
+      onBtn.onclick = function () { sendPump("on", onBtn, offBtn); };
+      offBtn.onclick = function () { sendPump("off", onBtn, offBtn); };
+      box.appendChild(onBtn);
+      box.appendChild(offBtn);
+      wrap.appendChild(box);
+      var hint = el("div", "read-foot", "บอร์ดทำตามภายใน 15 วินาที ปั๊มที่เปิดด้วยมือจะปิดเองเมื่อครบ 10 นาที");
+      hint.style.marginTop = "8px";
+      wrap.appendChild(hint);
+    } else {
+      var h2 = el("div", "read-foot", "โหมดอัตโนมัติ: บอร์ดเปิดปิดปั๊มเองตามช่วงระดับน้ำ ถ้าจะสั่งเองให้สลับเป็นควบคุมเอง");
+      h2.style.marginTop = "8px";
+      wrap.appendChild(h2);
+    }
+    pumpHost.appendChild(wrap);
+  }
+
+  async function sendPump(cmd, onBtn, offBtn) {
+    var iot = iotConf();
+    onBtn.disabled = offBtn.disabled = true;
+    try {
+      var res = await fetch(iot.url.replace(/\/+$/, "") + "/pump", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Key": iot.key || "" },
+        body: JSON.stringify({ cmd: cmd })
+      });
+      if (res.status === 401) throw new Error("รหัสอุปกรณ์ไม่ตรง ให้ผู้ดูแลระบบตรวจที่หน้าผู้ดูแลระบบ");
+      if (!res.ok) throw new Error("Worker ตอบ HTTP " + res.status);
+      note(el("div", "flash flash-ok", cmd === "on"
+        ? "สั่งเปิดปั๊มแล้ว รอบอร์ดตอบรับไม่เกิน 15 วินาที"
+        : "สั่งปิดปั๊มแล้ว รอบอร์ดตอบรับไม่เกิน 15 วินาที"));
+    } catch (e) {
+      note(el("div", "flash flash-warn", "สั่งปั๊มไม่สำเร็จ: " +
+        (e.message === "Failed to fetch" ? "ติดต่อ Worker ไม่ได้ ตรวจอินเทอร์เน็ตและที่อยู่ Worker" : e.message)));
+    }
+    onBtn.disabled = offBtn.disabled = false;
+  }
+
+  // อ่านระดับน้ำและสถานะปั๊มจากบอร์ดผ่าน Worker
+  // บันทึกลงประวัติเฉพาะค่าใหม่ที่เปลี่ยนเกิน 0.5 ซม. หรือครบ 5 นาที ไม่งั้นประวัติ 200 ค่าจะเต็มใน 50 นาที
+  async function pollSensor(showMsg) {
+    var iot = iotConf();
+    if (!iot.url) {
+      if (showMsg) note(el("div", "flash flash-warn", "ยังไม่ได้เชื่อมบอร์ด ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ"));
+      return;
+    }
+    try {
+      var ctrl = new AbortController();
+      var t = setTimeout(function () { ctrl.abort(); }, 8000);
+      var res = await fetch(iot.url.replace(/\/+$/, "") + "/level", { signal: ctrl.signal });
+      clearTimeout(t);
+      var d = await res.json();
+
+      var st = WaterStore.read();
+      if (typeof d.pump === "boolean" && d.at) st.pumpState = { on: d.pump, known: true, at: d.at };
+      var v = parseFloat(d.level_cm);
+      var out = null;
+      if (!isNaN(v) && d.at && d.at !== st.sensorAt) {
+        var prev = st.log.filter(function (r) { return r.src === "auto"; }).pop();
+        var doRecord = !prev || Math.abs(prev.v - v) >= 0.5 || Date.now() - prev.at >= 300000;
+        st.sensorAt = d.at;
+        WaterStore.write(st);
+        if (doRecord) out = await recordWater(v, "auto");
+      } else {
+        WaterStore.write(st);
+      }
+      paintAll();
+      if (showMsg) {
+        if (isNaN(v)) note(el("div", "read-foot", "บอร์ดยังไม่ส่งค่าระดับน้ำมา"));
+        else note(el("div", "read-foot", out && out.note ? out.note : "อ่านค่าจากบอร์ดแล้ว"));
+      }
+    } catch (e) {
+      if (showMsg) {
+        note(el("div", "flash flash-warn", "อ่านค่าจากบอร์ดไม่ได้: " +
+          (e.name === "AbortError" ? "หมดเวลา" : e.message) + " ตรวจอินเทอร์เน็ตและที่อยู่ Worker"));
+      }
+    }
+  }
+
   function paintMode() {
     var st = WaterStore.read();
+    var iot = iotConf();
     modeHost.innerHTML = "";
 
-    var lab = el("div", "read-foot", "วิธีรับค่าระดับน้ำ");
+    var lab = el("div", "read-foot", "โหมดควบคุมปั๊ม");
     lab.style.marginTop = "14px";
     modeHost.appendChild(lab);
 
@@ -7469,80 +7599,47 @@ views.water = function (root) {
         var s = WaterStore.read();
         s.mode = m[0];
         WaterStore.write(s);
-        pushTarget(s).catch(function () { /* ส่งไม่ได้ก็ไม่ขวางการสลับโหมด */ });
-        open(here);   // วาดหน้าใหม่ เพื่อเริ่ม/หยุดตัวอ่านเซนเซอร์ให้ตรงโหมด
+        // สลับโหมดแล้วเคลียร์คำสั่งปั๊มค้างเสมอ กันปั๊มเปิดเองจากคำสั่งเก่า
+        pushTarget(s).then(function () { return sendPumpQuiet("off"); }).catch(function () { /* ส่งไม่ได้ก็ไม่ขวางการสลับโหมด */ });
+        open(here);
       };
       chips.appendChild(b);
     });
     modeHost.appendChild(chips);
 
-    var msg = el("div");
-    msg.style.marginTop = "10px";
-
+    var r = rowBox();
     if (st.mode === "manual") {
       var lvl = numInput("เช่น 5", null);
       var save = el("button", "act act-go act-sm", "บันทึกระดับน้ำ");
-      var r = rowBox();
-      r.appendChild(labeled("ระดับน้ำที่วัดได้ (ซม.) ใส่ค่าลบถ้าน้ำต่ำกว่าผิวดิน", lvl));
+      r.appendChild(labeled("กรอกระดับน้ำที่วัดเอง (ซม.) ใส่ค่าลบถ้าน้ำต่ำกว่าผิวดิน", lvl));
       r.appendChild(save);
-      modeHost.appendChild(r);
-      modeHost.appendChild(msg);
       save.onclick = async function () {
         var v = parseFloat(lvl.value);
-        if (isNaN(v)) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "กรอกระดับน้ำเป็นตัวเลขก่อน")); return; }
+        if (isNaN(v)) { note(el("div", "flash flash-warn", "กรอกระดับน้ำเป็นตัวเลขก่อน")); return; }
         save.disabled = true;
         var res = await recordWater(v, "manual");
         save.disabled = false;
         lvl.value = "";
         paintStatus();
-        msg.innerHTML = "";
-        if (res.note) msg.appendChild(el("div", "read-foot", res.note));
+        note(res.note ? el("div", "read-foot", res.note) : null);
       };
-    } else {
-      var readNow = el("button", "act act-line act-sm", "อ่านตอนนี้");
-      var r2 = rowBox();
-      r2.style.marginTop = "0";
-      r2.appendChild(readNow);
-      modeHost.appendChild(r2);
-      modeHost.appendChild(msg);
-      readNow.onclick = function () { pollSensor(true); };
-
-      msg.appendChild(el("div", "read-foot",
-        iotConf().url
-          ? "รับระดับน้ำจากบอร์ดอัตโนมัติทุก 1 นาทีขณะเปิดหน้านี้"
-          : "ยังไม่ได้เชื่อมบอร์ด ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ"));
-
-      // อ่านเองทุก 1 นาทีขณะเปิดหน้านี้ ตัวจับเวลาจะถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
-      if (iotConf().url) {
-        pollSensor(false);
-        onPageTimer(function () { pollSensor(false); }, 60000);
-      }
-
-      async function pollSensor(showErr) {
-        var s = WaterStore.read();
-        var srcUrl = iotConf().url ? iotConf().url.replace(/\/+$/, "") + "/level" : null;
-        if (!srcUrl) { if (showErr) { msg.innerHTML = ""; msg.appendChild(el("div", "flash flash-warn", "ยังไม่ได้เชื่อมบอร์ด ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ")); } return; }
-        try {
-          var ctrl = new AbortController();
-          var t = setTimeout(function () { ctrl.abort(); }, 8000);
-          var res = await fetch(srcUrl, { signal: ctrl.signal });
-          clearTimeout(t);
-          var d = await res.json();
-          var v = parseFloat(d.level_cm != null ? d.level_cm : d.level);
-          if (isNaN(v)) throw new Error("ไม่พบฟิลด์ level_cm ในคำตอบ");
-          var out = await recordWater(v, "auto");
-          paintStatus();
-          if (showErr && out.note) { msg.innerHTML = ""; msg.appendChild(el("div", "read-foot", out.note)); }
-        } catch (e) {
-          if (showErr) {
-            msg.innerHTML = "";
-            msg.appendChild(el("div", "flash flash-warn",
-              "อ่านเซนเซอร์ไม่ได้: " + (e.name === "AbortError" ? "หมดเวลา" : e.message) +
-              " (เบราว์เซอร์ต้องเข้าถึงที่อยู่นี้ได้ และต้องเป็น https ถ้าเว็บนี้เปิดผ่าน https)"));
-          }
-        }
-      }
     }
+    if (iot.url) {
+      var readNow = el("button", "act act-line act-sm", "อ่านค่าจากบอร์ดตอนนี้");
+      readNow.onclick = function () { pollSensor(true); };
+      r.appendChild(readNow);
+    }
+    modeHost.appendChild(r);
+  }
+
+  async function sendPumpQuiet(cmd) {
+    var iot = iotConf();
+    if (!iot.url) return;
+    await fetch(iot.url.replace(/\/+$/, "") + "/pump", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Key": iot.key || "" },
+      body: JSON.stringify({ cmd: cmd })
+    });
   }
 
   // ── 2) แจ้งเตือน Telegram ──
@@ -7663,8 +7760,15 @@ views.water = function (root) {
   };
 
   paintStatus();
+  paintPump();
   paintMode();
   paintTg();
+
+  // เชื่อมบอร์ดแล้ว อ่านทุก 15 วินาทีขณะเปิดหน้านี้ ตัวจับเวลาถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
+  if (iotConf().url) {
+    pollSensor(false);
+    onPageTimer(function () { pollSensor(false); }, 15000);
+  }
 };
 
 
@@ -12052,6 +12156,20 @@ views.admin = async function (root) {
     if (val) i.value = val;
     return i;
   }
+  function withToggle(input) {
+    var box = el("div");
+    box.style.cssText = "display:flex;gap:6px;align-items:center";
+    var btn = el("button", "act act-line act-sm", "แสดง");
+    btn.type = "button";
+    btn.onclick = function () {
+      var hidden = input.type === "password";
+      input.type = hidden ? "text" : "password";
+      btn.textContent = hidden ? "ซ่อน" : "แสดง";
+    };
+    box.appendChild(input);
+    box.appendChild(btn);
+    return box;
+  }
   function iotField(label, node) {
     var b = el("div");
     b.appendChild(el("div", "read-foot", label));
@@ -12063,7 +12181,7 @@ views.admin = async function (root) {
   var iotRow = el("div");
   iotRow.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap";
   iotRow.appendChild(iotField("ที่อยู่ Worker", wUrl));
-  iotRow.appendChild(iotField("รหัสอุปกรณ์", wKey));
+  iotRow.appendChild(iotField("รหัสอุปกรณ์", withToggle(wKey)));
   iotCard.appendChild(iotRow);
   var saveW = el("button", "act act-go act-sm", "บันทึกและส่งค่าให้บอร์ด");
   saveW.style.marginTop = "12px";
@@ -12094,7 +12212,7 @@ views.admin = async function (root) {
   var tChat = iotInput("text", "เช่น 123456789", tc.chat || "", "170px");
   var tgRow = el("div");
   tgRow.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap";
-  tgRow.appendChild(iotField("Bot Token (จาก @BotFather)", tTok));
+  tgRow.appendChild(iotField("Bot Token (จาก @BotFather)", withToggle(tTok)));
   tgRow.appendChild(iotField("Chat ID", tChat));
   tgCard.appendChild(tgRow);
   var tgBtns = el("div");
