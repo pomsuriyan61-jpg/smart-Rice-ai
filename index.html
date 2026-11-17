@@ -7323,8 +7323,8 @@ async function iotRequest(path, options) {
     if (Session.token !== accountToken || (!management && iotConf().device_id !== c.device_id))
       throw new Error("เปลี่ยนบัญชีหรืออุปกรณ์ระหว่างรอ กรุณาลองใหม่");
     if (res.ok && !management && d.device_id !== c.device_id) throw new Error("ข้อมูลตอบกลับไม่ตรงอุปกรณ์");
-    if (res.status === 401) throw new Error("ยืนยันตัวตนไม่ผ่าน กรุณาเข้าสู่ระบบใหม่");
-    if (!res.ok) throw new Error(d.error || ("HTTP " + res.status));
+    if (res.status === 401) throw new Error((d.error || "ยืนยันตัวตนไม่ผ่าน กรุณาเข้าสู่ระบบใหม่") + (d.code ? " [" + d.code + "]" : ""));
+    if (!res.ok) throw new Error((d.error || ("HTTP " + res.status)) + (d.code ? " [" + d.code + "]" : ""));
     return d;
   } finally { clearTimeout(timer); }
 }
