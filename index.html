@@ -7582,7 +7582,11 @@ views.water = function (root) {
     else if (!iot.url) { value = "ยังไม่ได้เชื่อมบอร์ด"; foot = "ให้ผู้ดูแลระบบตั้งค่าที่หน้าผู้ดูแลระบบ"; }
     else if (!ps || !ps.known || Date.now() - ps.at > 45000) { value = "ยังไม่ทราบสถานะ"; foot = "รอรับข้อมูลจากบอร์ด"; }
     else { value = ps.on ? "เปิดอยู่" : "ปิดอยู่"; foot = "คำสั่งรีเลย์จากบอร์ดเมื่อ " + waterWhen(ps.at); }
-    wrap.appendChild(readOut("สถานะปั๊ม", value, foot));
+    if (pendingPump) {
+      foot = "รายงานล่าสุดจากบอร์ด · " + value + (ps && ps.at ? " · " + waterWhen(ps.at) : "");
+      value = "รอยืนยัน" + (pendingPump.on ? "เปิด" : "ปิด");
+    }
+    wrap.appendChild(readOut("สถานะรีเลย์ปั๊ม", value, foot));
     if (pendingPump) {
       var waiting = Date.now() - pendingPump.started < 60000;
       wrap.appendChild(el("div", "flash flash-warn", waiting
@@ -7610,7 +7614,7 @@ views.water = function (root) {
       box.appendChild(onBtn);
       box.appendChild(offBtn);
       wrap.appendChild(box);
-      var hint = el("div", "read-foot", "บอร์ดตรวจคำสั่งทุกประมาณ 15 วินาที เครือข่ายอาจทำให้ช้าลง คำสั่งเปิดหมดอายุภายใน 10 นาที");
+      var hint = el("div", "read-foot", "บอร์ดรุ่นล่าสุดตรวจคำสั่งควบคุมเองทุกประมาณ 2 วินาที เครือข่ายอาจทำให้ช้าลง คำสั่งเปิดหมดอายุภายใน 10 นาที");
       hint.style.marginTop = "8px";
       wrap.appendChild(hint);
     } else {
@@ -7699,6 +7703,7 @@ views.water = function (root) {
     [["manual", "ควบคุมเอง"], ["auto", "อัตโนมัติ"]].forEach(function (m) {
       var b = el("button", "act act-sm " + (st.mode === m[0] ? "act-go" : "act-line"), m[1]);
       b.onclick = async function () {
+        if (WaterStore.read().mode === m[0]) return;
         var current = WaterStore.read(), next = Object.assign({}, current, { mode: m[0] });
         b.disabled = true;
         try {
@@ -12299,6 +12304,7 @@ views.admin = async function (root) {
     "ที่อยู่นี้มีค่าตั้งต้นในโค้ดอยู่แล้ว เปลี่ยนเฉพาะเมื่อย้าย Worker"));
   root.appendChild(iotCard);
   saveW.onclick = async function () {
+    saveW.disabled = true;
     wMsg.innerHTML = "";
     try {
       iotSave({ url: wUrl.value.trim() });
@@ -12307,17 +12313,15 @@ views.admin = async function (root) {
         if (list.devices.length !== 1 || list.cursor) throw new Error("เลือกบอร์ดในหน้าอุปกรณ์ของฉันก่อน");
         iotSave({url: iotConf().url, device_id: list.devices[0].id});
       }
-      var st = WaterStore.read();
-      st.mode = "manual";
-      if (!Number.isFinite(st.min) || !Number.isFinite(st.max)) { st.min = 0; st.max = 3; }
-      await iotRequest("/pump", {method:"POST", body:JSON.stringify({cmd:"off"})});
-      await pushTarget(st);
-      WaterStore.write(st);
-      var m = "เชื่อมแล้วในโหมดควบคุมเอง รอบอร์ดตรวจ Safety";
-      wMsg.appendChild(el("div", m ? "flash flash-ok" : "read-foot", m || "บันทึกแล้ว"));
+      var report = await iotRequest("/level");
+      var fresh = !report.stale && typeof report.pump === "boolean" && Date.now() - report.at <= 45000;
+      var message = fresh ? "รับข้อมูลจากบอร์ดแล้ว · รีเลย์" + (report.pump ? "เปิด" : "ปิด")
+                          : "ติดต่อ Worker ได้ กำลังรอข้อมูลใหม่จากบอร์ด";
+      if (fresh && report.status !== "ready") message += " · Safety " + (report.fault || report.status);
+      wMsg.appendChild(el("div", fresh && report.status === "ready" ? "flash flash-ok" : "flash flash-warn", message));
     } catch (e) {
       wMsg.appendChild(el("div", "flash flash-warn", "เชื่อมไม่สำเร็จ: " + e.message));
-    }
+    } finally { saveW.disabled = false; }
   };
 
   // ══ Telegram (แจ้งเตือนระดับน้ำจากเว็บ) ══
