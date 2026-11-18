@@ -7341,7 +7341,7 @@ async function pushTarget(st) {
     min: clear ? null : st.min, max: clear ? null : st.max, stage: st.stage || null, auto: !clear && st.mode === "auto"
   }) });
   return clear ? "ยกเลิกเป้าหมายแล้ว ปั๊มจะหยุดเมื่อบอร์ดรับค่า" :
-    "ส่งเป้าหมายแล้ว มีอายุ 10 นาที ต้องบันทึกยืนยันใหม่เมื่อหมดอายุ";
+    "บันทึกช่วงแล้ว บอร์ดจะอ่านช่วงนี้จนกว่าจะเปลี่ยน";
 }
 
 // Telegram secrets live exclusively in Worker. Remove legacy browser secrets.
@@ -12287,7 +12287,7 @@ views.admin = async function (root) {
   iotRow.style.cssText = "display:flex;gap:11px;align-items:flex-end;flex-wrap:wrap";
   iotRow.appendChild(iotField("ที่อยู่ Worker", wUrl));
   iotCard.appendChild(iotRow);
-  var saveW = el("button", "act act-go act-sm", "บันทึกและส่งค่าให้บอร์ด");
+  var saveW = el("button", "act act-go act-sm", "เชื่อมบอร์ด");
   saveW.style.marginTop = "12px";
   iotCard.appendChild(saveW);
   var wMsg = el("div");
@@ -12302,7 +12302,18 @@ views.admin = async function (root) {
     wMsg.innerHTML = "";
     try {
       iotSave({ url: wUrl.value.trim() });
-      var m = await pushTarget(WaterStore.read());
+      if (!iotConf().device_id) {
+        var list = await iotRequest("/devices");
+        if (list.devices.length !== 1 || list.cursor) throw new Error("เลือกบอร์ดในหน้าอุปกรณ์ของฉันก่อน");
+        iotSave({url: iotConf().url, device_id: list.devices[0].id});
+      }
+      var st = WaterStore.read();
+      st.mode = "manual";
+      if (!Number.isFinite(st.min) || !Number.isFinite(st.max)) { st.min = 0; st.max = 3; }
+      await iotRequest("/pump", {method:"POST", body:JSON.stringify({cmd:"off"})});
+      await pushTarget(st);
+      WaterStore.write(st);
+      var m = "เชื่อมแล้วในโหมดควบคุมเอง รอบอร์ดตรวจ Safety";
       wMsg.appendChild(el("div", m ? "flash flash-ok" : "read-foot", m || "บันทึกแล้ว"));
     } catch (e) {
       wMsg.appendChild(el("div", "flash flash-warn", "เชื่อมไม่สำเร็จ: " + e.message));
