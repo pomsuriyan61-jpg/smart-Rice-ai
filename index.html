@@ -7349,10 +7349,6 @@ function tgConf() { return { worker: true }; }
 function tgSave() { localStorage.removeItem("smartrice-tg"); }
 tgSave();
 try { localStorage.removeItem("smartrice-iot"); } catch (e) {}
-async function tgSend(text) {
-  await iotRequest("/alert", { method: "POST", body: JSON.stringify({ text: text }) });
-}
-
 // low = ต่ำกว่าช่วง, high = สูงกว่าช่วง, ok = อยู่ในช่วง, null = ยังไม่ได้ตั้งช่วง
 function waterZone(level, st) {
   if (typeof level !== "number" || isNaN(level)) return null;
@@ -7386,25 +7382,6 @@ async function recordWater(level, source, measuredAt) {
   var zone = waterZone(level, st);
   var note = null;
 
-  if (st.tg && (zone === "low" || zone === "high")) {
-    var last = st.lastAlert;
-    if (!(last && last.zone === zone && now - last.at < 30 * 60 * 1000)) {
-      var plotName = (Plots.list().filter(function (p) { return p.id === Plots.activeId(); })[0] || {}).name || "ที่นา";
-      var msg = "SmartRice AI · " + plotName + "\n" +
-        "ระดับน้ำ " + level + " ซม. " + (zone === "low" ? "ต่ำกว่า" : "สูงกว่า") +
-        "ช่วงที่ตั้งไว้ (" + waterRangeText(st) + ")\n" +
-        (zone === "low" ? "ควรเติมน้ำเข้าแปลง" : "ควรระบายน้ำออก");
-      try {
-        await tgSend(msg);
-        st.lastAlert = { zone: zone, at: now };
-        note = "ส่งแจ้งเตือนไป Telegram แล้ว";
-      } catch (e) {
-        note = "ส่ง Telegram ไม่สำเร็จ: " + e.message;
-      }
-    }
-  } else if (zone === "ok") {
-    st.lastAlert = null;   // กลับเข้าช่วงแล้ว ครั้งหน้าที่หลุดช่วงต้องแจ้งทันที
-  }
   if (initialAccount === iotAccountKey() && initialDevice === iotConf().device_id) WaterStore.write(st);
   return { zone: zone, note: note };
 }
@@ -7521,6 +7498,7 @@ views.water = function (root) {
   var card1 = plot(null);
   statusHost = el("div");
   card1.appendChild(statusHost);
+  var acknowledgmentMessage = "", acknowledgmentAt = 0, acknowledgmentSending = false;
   var pendingPump = null, postingPump = false, pollingLevel = false, lastPoll = 0;
   var pumpHost = el("div");
   card1.appendChild(pumpHost);
@@ -7595,8 +7573,35 @@ views.water = function (root) {
     }
     if (ps && (ps.fault || (ps.status && ps.status !== "ready")))
       wrap.appendChild(el("div", "flash flash-warn", "Safety: " + (ps.fault || ps.status) +
-        (ps.fault ? " — ตรวจอุปกรณ์และปลดล็อกผ่าน USB Serial หน้างาน" : "")));
+        (ps.fault ? " — ตรวจอุปกรณ์ แล้วเลือกควบคุมเองเพื่อยืนยัน" : "")));
 
+    if (ps && ps.known && ps.status === "ready" && !ps.fault && Date.now()-ps.at < 45000)
+      wrap.appendChild(el("div","read-foot","พร้อมใช้งาน"));
+    if (ps && ps.fault && ps.seq && st.mode === "manual") {
+      var ack = el("button","act act-line act-sm","ตรวจแล้ว ขอพร้อมใช้งาน");
+      var freshReport = ps.known && Date.now() - ps.at <= 45000;
+      var reason = !freshReport ? "รอรายงานใหม่จากบอร์ด" :
+        !ps.sensorOK ? "บอร์ดยังอ่านเซนเซอร์ไม่ได้ ตรวจหัววัดและสาย แล้วรอค่าระดับน้ำใหม่" :
+        ps.on ? "รอให้บอร์ดรายงานว่าปั๊มปิด" : "";
+      ack.disabled = !!reason || acknowledgmentSending || (acknowledgmentAt && Date.now() - acknowledgmentAt < 30000);
+      ack.onclick = async function () {
+        acknowledgmentSending = true;
+        acknowledgmentMessage = "กำลังส่งคำยืนยัน";
+        paintPump();
+        try {
+          await iotRequest("/pump",{method:"POST",body:JSON.stringify({cmd:"ack",boot_id:ps.boot,fault_seq:ps.seq})});
+          acknowledgmentAt = Date.now();
+          acknowledgmentMessage = "ส่งแล้ว กำลังรอบอร์ดยืนยัน";
+          pollSensor(false);
+        } catch(e) { acknowledgmentMessage = e.message; }
+        finally { acknowledgmentSending = false; paintPump(); }
+      };
+      if (reason || acknowledgmentMessage) {
+        var timedOut = acknowledgmentAt && Date.now() - acknowledgmentAt >= 30000;
+        wrap.appendChild(el("div","read-foot",reason || (timedOut ? "ยังไม่ได้รับการยืนยันจากบอร์ด ตรวจช่วงน้ำและโหมดควบคุมเองก่อนลองอีกครั้ง" : acknowledgmentMessage)));
+      }
+      wrap.appendChild(ack);
+    }
     if (ps && ps.known && Date.now() - ps.at > 120000) {
       wrap.appendChild(el("div", "flash flash-warn",
         "บอร์ดไม่ส่งข้อมูลมานานกว่า 2 นาที สถานะที่เห็นอาจไม่ตรงกับปั๊มจริง ตรวจไฟและ WiFi ของบอร์ด"));
@@ -7663,7 +7668,8 @@ views.water = function (root) {
         pendingPump = null;
       }
       st.pumpState = { on: d.pump === true, known: typeof d.pump === "boolean" && !d.stale, at: d.at || 0,
-        fault: d.fault || "", status: d.status || "unknown" };
+        sensorOK: d.sensor_ok === true, seq: d.fault_seq, boot: d.boot_id, fault: d.fault || "", status: d.status || "unknown" };
+      if (!d.stale && !d.fault) { acknowledgmentAt = 0; acknowledgmentMessage = ""; }
       var v = d.sensor_ok && !d.stale && Number.isFinite(d.level_cm) ? d.level_cm : NaN;
       var out = null;
       if (!isNaN(v) && d.at && d.at !== st.sensorAt) {
@@ -7705,11 +7711,16 @@ views.water = function (root) {
       b.onclick = async function () {
         if (WaterStore.read().mode === m[0]) return;
         var current = WaterStore.read(), next = Object.assign({}, current, { mode: m[0] });
+        if (m[0] === "auto" && (!Number.isFinite(next.min) || !Number.isFinite(next.max))) {
+          note(el("div", "flash flash-warn", "บันทึกช่วงระดับน้ำก่อนเลือกอัตโนมัติ"));
+          return;
+        }
         b.disabled = true;
         try {
           await sendPumpQuiet("off");
           await pushTarget(next);
-          WaterStore.write(next);
+          var updated = WaterStore.read(); updated.mode = next.mode;
+          WaterStore.write(updated);
           open(here);
         } catch (e) { note(el("div", "flash flash-warn", "เปลี่ยนโหมดไม่สำเร็จ: " + e.message)); }
         finally { b.disabled = false; }
@@ -7747,46 +7758,6 @@ views.water = function (root) {
     var iot = iotConf();
     if (!iot.url) return;
     await iotRequest("/pump", { method: "POST", body: JSON.stringify({ cmd: cmd }) });
-  }
-
-  // ── 2) แจ้งเตือน Telegram ──
-  root.appendChild(bund("แจ้งเตือน Telegram"));
-  var card2 = plot(null);
-  var tgHost = el("div");
-  card2.appendChild(tgHost);
-  root.appendChild(card2);
-
-  function paintTg() {
-    tgHost.innerHTML = "";
-    var selected = iotConf().device_id;
-    if (!selected) { tgHost.appendChild(el("div", "read-foot", "เลือกอุปกรณ์ก่อนตั้งค่า Telegram")); return; }
-    var chat = textInput("text", "Chat ID ของคุณ เช่น 123456789", "", "min(100%,300px)");
-    var enabled = el("input"); enabled.type = "checkbox";
-    var enabledLabel = el("label", "", " เปิดแจ้งเตือนสำหรับอุปกรณ์นี้ "); enabledLabel.prepend(enabled);
-    var save = el("button", "act act-go act-sm", "บันทึก Telegram");
-    var test = el("button", "act act-line act-sm", "ทดสอบ Telegram"), msg = el("div");
-    tgHost.appendChild(enabledLabel); tgHost.appendChild(labeled("Telegram Chat ID ของคุณ", chat));
-    tgHost.appendChild(save); tgHost.appendChild(test); tgHost.appendChild(msg);
-    tgHost.appendChild(el("div", "read-foot", "เริ่มคุยกับบอตของระบบก่อน ใส่เฉพาะ Chat ID ที่คุณมีสิทธิ์ใช้ ระบบไม่ใช้ TG_CHAT ส่วนกลางส่งข้อมูลของทุกบัญชี"));
-    save.disabled = test.disabled = true;
-    iotRequest("/telegram").then(function (d) {
-      chat.value = d.chat_id; enabled.checked = d.enabled; save.disabled = test.disabled = false;
-    }).catch(function (e) { msg.textContent = "โหลดค่า Telegram ไม่สำเร็จ: " + e.message; });
-    save.onclick = async function () {
-      save.disabled = true;
-      try {
-        await iotRequest("/telegram", { method: "POST", body: JSON.stringify({ enabled: enabled.checked, chat_id: chat.value.trim() }) });
-        var st = WaterStore.read(); st.tg = enabled.checked; WaterStore.write(st);
-        msg.textContent = "บันทึกปลายทาง Telegram ของอุปกรณ์นี้แล้ว";
-      } catch (e) { msg.textContent = e.message; }
-      finally { save.disabled = false; }
-    };
-    test.onclick = async function () {
-      test.disabled = true;
-      try { await tgSend("SmartRice ทดสอบแจ้งเตือนอุปกรณ์ของคุณ"); msg.textContent = "ส่งข้อความทดสอบแล้ว"; }
-      catch (e) { msg.textContent = e.message; }
-      finally { test.disabled = false; }
-    };
   }
 
   // ── 3) เลือกช่วงระดับน้ำ ──
@@ -7870,15 +7841,17 @@ views.water = function (root) {
   paintStatus();
   paintPump();
   paintMode();
-  paintTg();
+
 
   // เชื่อมบอร์ดแล้ว อ่านทุก 15 วินาทีขณะเปิดหน้านี้ ตัวจับเวลาถูกล้างเองเมื่อเปลี่ยนหน้า (onPageTimer)
   if (iotConf().url && iotConf().device_id) {
     pollSensor(false);
     onPageTimer(function () {
-      paintPump();
-      if (pendingPump || Date.now() - lastPoll >= 15000) pollSensor(false);
-    }, 3000);
+      var checking = acknowledgmentAt && Date.now() - acknowledgmentAt < 30000;
+      var interval = checking || pendingPump ? 1000 : WaterStore.read().mode === "auto" ? 3000 : 15000;
+      if (!document.hidden && Date.now() - lastPoll >= interval) pollSensor(false);
+      if (pendingPump || acknowledgmentAt) paintPump();
+    }, 1000);
   }
 };
 
@@ -12322,43 +12295,6 @@ views.admin = async function (root) {
     } catch (e) {
       wMsg.appendChild(el("div", "flash flash-warn", "เชื่อมไม่สำเร็จ: " + e.message));
     } finally { saveW.disabled = false; }
-  };
-
-  // ══ Telegram (แจ้งเตือนระดับน้ำจากเว็บ) ══
-  root.appendChild(bund("Telegram แจ้งเตือนระดับน้ำ"));
-  var tgCard = plot(null);
-  tgCard.appendChild(el("div", "read-foot", "ตั้ง TG_TOKEN ใน Worker Secrets; ผู้ใช้ตั้ง Chat ID แยกอุปกรณ์ที่ ข้อมูลการเกษตร → ระดับน้ำ → Telegram เว็บไม่เก็บ Bot Token"));
-  var tgBtns = el("div");
-  tgBtns.style.cssText = "display:flex;gap:9px;margin-top:12px;flex-wrap:wrap";
-  var tgSaveBtn = el("button", "act act-go act-sm", "ตั้งค่าที่หน้าระดับน้ำ");
-  var tgTestBtn = el("button", "act act-line act-sm", "ส่งข้อความทดสอบ");
-  tgBtns.appendChild(tgSaveBtn);
-  tgBtns.appendChild(tgTestBtn);
-  tgCard.appendChild(tgBtns);
-  var tgMsg = el("div");
-  tgMsg.style.marginTop = "10px";
-  tgCard.appendChild(tgMsg);
-  tgCard.appendChild(el("div", "read-foot",
-    "ส่งผ่าน Worker ของบัญชีเจ้าของอุปกรณ์ " +
-    "ผู้ใช้เปิด/ปิดแจ้งเตือนได้ที่แท็บแปลงนา ส่วนระดับน้ำ"));
-  root.appendChild(tgCard);
-  function tgPersist() { tgSave(); }
-  tgSaveBtn.onclick = async function () {
-    await open("field");
-    var jump = Array.from(document.querySelectorAll("button")).find(function (b) { return b.textContent === "ระดับน้ำ"; });
-    if (jump) jump.click();
-  };
-  tgTestBtn.onclick = async function () {
-    tgPersist();
-    tgMsg.innerHTML = "";
-    tgTestBtn.disabled = true;
-    try {
-      await tgSend("SmartRice AI: ทดสอบการแจ้งเตือนระดับน้ำ ใช้งานได้ตามปกติ");
-      tgMsg.appendChild(el("div", "flash flash-ok", "ส่งข้อความทดสอบแล้ว ตรวจใน Telegram"));
-    } catch (e) {
-      tgMsg.appendChild(el("div", "flash flash-warn", "ส่งไม่สำเร็จ: " + e.message));
-    }
-    tgTestBtn.disabled = false;
   };
 
   // ══ สถานะบริการ AI ══
