@@ -7848,7 +7848,7 @@ views.water = function (root) {
     pollSensor(false);
     onPageTimer(function () {
       var checking = acknowledgmentAt && Date.now() - acknowledgmentAt < 30000;
-      var interval = checking || pendingPump ? 1000 : WaterStore.read().mode === "auto" ? 3000 : 15000;
+      var interval = checking || pendingPump ? 1000 : 3000;
       if (!document.hidden && Date.now() - lastPoll >= interval) pollSensor(false);
       if (pendingPump || acknowledgmentAt) paintPump();
     }, 1000);
