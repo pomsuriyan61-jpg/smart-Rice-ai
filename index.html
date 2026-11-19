@@ -3954,7 +3954,7 @@ function exportCsv(logs) {
   var url = URL.createObjectURL(blob);
   var a = document.createElement("a");
   a.href = url;
-  a.download = "smartrice-บันทึกแปลง-" + new Date().toISOString().slice(0, 10) + ".csv";
+  a.download = "smartrice-บันทึกแปลง-" + localDateToIso(new Date()) + ".csv";
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -4097,7 +4097,7 @@ async function fetchWeather(lat, lon) {
   }
 
   var todayIndex = days.findIndex(function (day) {
-    return day.date === new Date().toISOString().slice(0, 10);
+    return day.date === localDateToIso(new Date());
   });
   if (todayIndex === -1) todayIndex = 7;
 
@@ -4502,14 +4502,23 @@ function setFieldVarietyKey(k) {
 // "2026-09-01" ต้องเป็นเที่ยงคืนของวันนั้นตามเวลาเครื่อง
 // new Date("2026-09-01") ให้เที่ยงคืน UTC ซึ่งในไทยคือ 07:00 ทำให้อายุข้าวและวันที่คำนวณเพี้ยนไป 1 วันได้
 function isoToLocalDate(iso) {
-  var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
-  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  var d = new Date(iso);
-  return isNaN(d.getTime()) ? null : d;
+  if (!iso) return null;
+  var m = /^(\d{4})-(\d{2})-(\d{2})(?:T.*)?$/.exec(String(iso));
+  if (m) {
+    var date = new Date(+m[1], +m[2] - 1, +m[3]);
+    return localDateToIso(date) === m[1] + "-" + m[2] + "-" + m[3] ? date : null;
+  }
+  var legacy = new Date(iso);
+  return isNaN(legacy.getTime()) ? null : legacy;
 }
 function localDateToIso(d) {
   return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" +
          String(d.getDate()).padStart(2, "0");
+}
+
+function calendarDaysBetween(from, to) {
+  function day(d) { return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()); }
+  return (day(new Date(to)) - day(new Date(from))) / 86400000;
 }
 
 function fieldSowDate() {
@@ -9880,7 +9889,7 @@ views.fert = async function (root) {
 
           // เตือนถ้าวันหว่านผ่านไปแล้ว — เป็นข้อผิดพลาดที่พบบ่อยที่สุดของปุ๋ยพืชสด
           // เพราะต้องเริ่มก่อนปลูกข้าวถึง 70 วัน ซึ่งคนมักนึกไม่ถึง
-          var daysLeft = Math.ceil((sowDay - new Date()) / 86400000);
+          var daysLeft = calendarDaysBetween(new Date(), sowDay);
           if (daysLeft < 0) {
             cal.appendChild(el("div", "flash flash-bad",
               "วันที่ควรหว่านปอเทืองผ่านมาแล้ว " + Math.abs(daysLeft) + " วัน " +
@@ -10536,7 +10545,7 @@ views.harvest = function (root) {
   // เป็นข้อผิดพลาดที่ทำให้ต้องเลื่อนคิวรถเกี่ยว ซึ่งค่าเสียหายมากกว่าค่าจ้างเสียอีก
   var cal = fieldCalendar();
   if (cal && cal.harvest) {
-    var daysLeft = Math.round((cal.harvest - Date.now()) / 86400000);
+    var daysLeft = calendarDaysBetween(new Date(), cal.harvest);
     if (daysLeft >= 0 && daysLeft <= 20 && pickKey === "combine") {
       var when = daysLeft <= 10
         ? "ควรระบายน้ำออกแล้วตอนนี้"
@@ -11199,7 +11208,7 @@ function weatherAdvice(w) {
   var st = (typeof window.stageWindows === "function") ? window.stageWindows(cal, m.key) : null;
   var age = st ? st.age : null;
   var stage = st ? st.current : null;
-  var dayTo = function (dt) { return Math.round((dt - new Date()) / 86400000); };
+  var dayTo = function (dt) { return calendarDaysBetween(new Date(), dt); };
 
   // 1. เมล็ดยังไม่ยึดดิน — ช่วงที่ฝนหนักทำลายทั้งแปลงได้ในคืนเดียว
   if (direct && age !== null && age >= 0 && age <= 10 && rainSoon >= 35) {
